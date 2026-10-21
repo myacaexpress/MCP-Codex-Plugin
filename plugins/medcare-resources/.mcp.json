@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "medcare-resources": {
+      "command": "./bin/medcare-mcp",
+      "args": [],
+      "cwd": ".",
+      "env_vars": ["MEDCARE_PYTHON", "MEDCARE_CACHE_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "SSL_CERT_FILE"],
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 300
+    }
+  }
+}

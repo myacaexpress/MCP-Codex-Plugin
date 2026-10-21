@@ -1,0 +1,39 @@
+{
+  "name": "medcare-resources",
+  "version": "1.0.0",
+  "description": "Public MedCare Partners Health Plan of Texas resources plus CMS/Medicare plan research with source provenance.",
+  "author": {
+    "name": "Independent team tool",
+    "url": "https://github.com/myacaexpress/MCP-Codex-Plugin"
+  },
+  "homepage": "https://github.com/myacaexpress/MCP-Codex-Plugin",
+  "repository": "https://github.com/myacaexpress/MCP-Codex-Plugin",
+  "keywords": [
+    "medicare",
+    "medicare-advantage",
+    "formulary",
+    "provider-directory",
+    "summary-of-benefits",
+    "cms",
+    "texas"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "MedCare Resources",
+    "shortDescription": "MedCare Partners TX resources and Medicare plan research",
+    "longDescription": "Search every public MedCare Partners Health Plan of Texas resource (plan documents with page citations, forms, formulary, provider, pharmacy and benefit-vendor directories), run live medication and provider lookups, and research any Medicare plan from official CMS data and verified carrier Summary of Benefits. Independent team tool; not an official health plan, CMS or Medicare.gov product. No member data or credentials.",
+    "developerName": "Independent team tool",
+    "category": "Productivity",
+    "capabilities": [
+      "Read"
+    ],
+    "websiteURL": "https://github.com/myacaexpress/MCP-Codex-Plugin",
+    "defaultPrompt": [
+      "Is Eliquis covered on MedCare Classic and what tier is it?",
+      "Find MedCare in-network cardiologists near ZIP 77072.",
+      "Compare MedCare Focus with other C-SNPs in Harris County for 2027."
+    ],
+    "brandColor": "#1F5FAD"
+  }
+}

@@ -1,0 +1,32 @@
+#!/bin/sh
+# Launch the MedCare Resources MCP server with any available Python >= 3.9.
+# Order: $MEDCARE_PYTHON, python3.x on PATH (Homebrew/python.org/system), then uv.
+# The server uses only the standard library plus the vendored pure-Python pypdf.
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin:${HOME:-/tmp}/.local/bin:${HOME:-/tmp}/.cargo/bin"
+export PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1
+
+usable() {
+  [ -n "$1" ] && [ -x "$1" ] || return 1
+  case "$1" in
+    /usr/bin/python3)
+      # On macOS without Command Line Tools this stub opens an install dialog; skip it.
+      if [ "$(uname -s)" = Darwin ] && ! /usr/bin/xcode-select -p >/dev/null 2>&1; then return 1; fi ;;
+  esac
+  "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1
+}
+
+if [ -n "${MEDCARE_PYTHON:-}" ] && usable "$MEDCARE_PYTHON"; then exec "$MEDCARE_PYTHON" "$here/server.py" "$@"; fi
+for name in python3.14 python3.13 python3.12 python3.11 python3.10 python3 python3.9; do
+  candidate=$(command -v "$name" 2>/dev/null || true)
+  if usable "$candidate"; then exec "$candidate" "$here/server.py" "$@"; fi
+done
+for candidate in /Library/Frameworks/Python.framework/Versions/*/bin/python3; do
+  if usable "$candidate"; then exec "$candidate" "$here/server.py" "$@"; fi
+done
+uv_bin=$(command -v uv 2>/dev/null || true)
+if [ -n "$uv_bin" ]; then exec "$uv_bin" run --quiet --script "$here/server.py" "$@"; fi
+
+echo "MedCare Resources: no Python 3.9+ found. Install Python 3 (python.org or 'brew install python') or uv, then restart Codex. You can also set MEDCARE_PYTHON to a python3 path." >&2
+exit 127
