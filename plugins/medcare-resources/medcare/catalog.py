@@ -82,7 +82,30 @@ def _brief(r: dict) -> dict:
             out["found_on_more"] = len(r["found_on"]) - 4
     if r.get("unlinked_media"):
         out["unlinked_media"] = True
+    out["access_mode"] = access_mode(r)
     return out
+
+
+AUTOMATED_EXTERNAL = {"client.formularynavigator.com": "medcare_drug_lookup"}
+
+
+def access_mode(r: dict) -> str:
+    """How this plugin can use the resource: snapshot_document, site_page, automated_live:<tool>,
+    browser_handoff (a person must open it; not read by the tool), or unavailable."""
+    st = r.get("status", "")
+    if st.startswith("unavailable") or st == "not_a_resource":
+        return "unavailable"
+    if st in ("phone", "email"):
+        return "contact_only"
+    url = r.get("url") or ""
+    host = (re.match(r"https?://([^/]+)", url) or [None, ""])[1].lower()
+    if host in AUTOMATED_EXTERNAL:
+        return f"automated_live:{AUTOMATED_EXTERNAL[host]}"
+    if host and host not in net.MEDCARE_HOSTS:
+        return "browser_handoff"
+    if r.get("document"):
+        return "snapshot_document"
+    return "site_page"
 
 
 def list_resources(category: str = "", audience: str = "", plan_id: str = "", status: str = "",

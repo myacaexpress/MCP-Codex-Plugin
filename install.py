@@ -37,7 +37,7 @@ def _copytree(src: Path, dst: Path):
 def check_server(plugin_dir: Path, timeout: int = 60) -> dict:
     """Start the server exactly as Codex does and run initialize + tools/list."""
     launcher = plugin_dir / "bin" / "medcare-mcp"
-    cmd = [str(launcher)] if os.name != "nt" else [sys.executable, str(plugin_dir / "server.py")]
+    cmd = [str(launcher)]  # exactly what Codex runs (.mcp.json)
     msgs = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize",
          "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "installer", "version": "1"}}},
@@ -53,7 +53,18 @@ def check_server(plugin_dir: Path, timeout: int = 60) -> dict:
     return {"server_ok": True, "tools": len(tools), "protocol": replies[0]["result"]["protocolVersion"]}
 
 
+def _atomic_write(path: Path, data: str) -> None:
+    tmp = path.with_name(path.name + f".tmp-{os.getpid()}")
+    try:
+        tmp.write_text(data)
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def install(home: Path, replace: bool) -> dict:
+    """Transactional install: plugin copy and marketplace entry either both change or neither does."""
     if not (SOURCE / ".codex-plugin" / "plugin.json").is_file():
         raise SystemExit(f"Plugin source not found at {SOURCE}. Run from the unzipped package root.")
     target = home / ".codex" / "plugins" / NAME
@@ -62,9 +73,10 @@ def install(home: Path, replace: bool) -> dict:
         raise SystemExit("Refusing to write through a symlink.")
     if target.exists() and not replace:
         raise SystemExit(f"{target} already exists. Re-run with --replace to update it.")
+    original_market = market.read_bytes() if market.exists() else None
     content = DEFAULT_MARKETPLACE
-    if market.exists():
-        content = json.loads(market.read_text())
+    if original_market is not None:
+        content = json.loads(original_market)
         if not isinstance(content, dict) or not isinstance(content.get("plugins"), list):
             raise SystemExit(f"{market} is not a marketplace object with a 'plugins' list; not modifying it.")
     entry = {"name": NAME, "source": {"source": "local", "path": f"./.codex/plugins/{NAME}"},
@@ -74,25 +86,42 @@ def install(home: Path, replace: bool) -> dict:
         raise SystemExit("Marketplace already lists medcare-resources; re-run with --replace to update it.")
     content = {**content, "plugins": others + [entry]}
     target.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{NAME}-", dir=target.parent))
+    market.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{NAME}-staging-", dir=target.parent))
+    rollback = target.with_name(f".{NAME}.rollback-{os.getpid()}")
+    moved_old = moved_new = False
     try:
         _copytree(SOURCE, staging / NAME)
-        launcher = staging / NAME / "bin" / "medcare-mcp"
-        launcher.chmod(0o755)
-        check = check_server(staging / NAME)
+        (staging / NAME / "bin" / "medcare-mcp").chmod(0o755)
+        check = check_server(staging / NAME)          # nothing installed has changed yet
         if target.exists():
-            backup = target.with_name(f"{NAME}.previous")
-            if backup.exists():
-                shutil.rmtree(backup)
-            target.rename(backup)
+            target.rename(rollback)
+            moved_old = True
         (staging / NAME).rename(target)
+        moved_new = True
+        _atomic_write(market, json.dumps(content, indent=2) + "\n")
+    except BaseException:
+        # Roll back code and registration together.
+        if moved_new:
+            shutil.rmtree(target, ignore_errors=True)
+        if moved_old and rollback.exists():
+            rollback.rename(target)
+        if original_market is None:
+            if market.exists():
+                market.unlink()
+        elif not market.exists() or market.read_bytes() != original_market:
+            market.write_bytes(original_market)
+        raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    market.parent.mkdir(parents=True, exist_ok=True)
-    tmp = market.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(content, indent=2) + "\n")
-    tmp.replace(market)
+    previous = None
+    if moved_old:
+        previous = target.with_name(f"{NAME}.previous")
+        if previous.exists():
+            shutil.rmtree(previous)
+        rollback.rename(previous)
     return {"installed_to": str(target), "marketplace": str(market), "marketplace_name": content["name"], **check,
+            "previous_version_kept_at": str(previous) if previous else None,
             "next_steps": [f"CLI: codex plugin add {NAME}@{content['name']}",
                            "Desktop: restart the ChatGPT/Codex desktop app -> Plugins -> choose the "
                            f"'{content.get('interface', {}).get('displayName', content['name'])}' source -> Install "
@@ -111,7 +140,7 @@ def uninstall(home: Path) -> dict:
         plugins = [p for p in content.get("plugins", []) if p.get("name") != NAME]
         if len(plugins) != len(content.get("plugins", [])):
             content["plugins"] = plugins
-            market.write_text(json.dumps(content, indent=2) + "\n")
+            _atomic_write(market, json.dumps(content, indent=2) + "\n")
             removed.append(f"{market} entry")
     return {"removed": removed,
             "note": f"If installed via Codex, also run: codex plugin remove {NAME}@<marketplace>. Cached public data "
@@ -119,6 +148,9 @@ def uninstall(home: Path) -> dict:
 
 
 def main():
+    if os.name == "nt":
+        raise SystemExit("MedCare Resources supports macOS and Linux only in this release (the Codex MCP launcher is a "
+                         "POSIX shell script). Windows is not supported; see README 'Platform support'.")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--home", type=Path, default=Path.home(), help="Home directory (for isolated testing).")
     ap.add_argument("--replace", action="store_true", help="Replace an existing installation (keeps one backup).")

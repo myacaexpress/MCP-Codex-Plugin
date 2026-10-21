@@ -226,6 +226,55 @@ def _normalize_provider(raw: dict) -> dict:
     return {k: v for k, v in out.items() if v not in (None, [], "")}
 
 
+def _plan_matches(entry_plan: str, wanted: str) -> bool:
+    try:
+        wc, wp, ws = cms.parse_plan_id(wanted)
+        ec, ep, es = cms.parse_plan_id(entry_plan or "")
+    except ValueError:
+        return False
+    return wc == ec and wp == ep and (ws is None or ws == (es or "000"))
+
+
+def filter_providers(results: list[dict], specialty: str = "", plan_id: str = "",
+                     accepting_only: bool = False) -> tuple[list[dict], dict]:
+    """Apply plan, specialty and accepting-new-patients filters to the SAME plan entry.
+
+    Records without per-plan data (some facility records) have unknown plan membership and
+    unknown acceptance; they are excluded whenever plan_id or accepting_only is requested.
+    """
+    excluded = {"unknown_plan_membership": 0, "no_matching_plan_entry": 0}
+    spec = fold(specialty) if specialty else ""
+    out = []
+    for p in results:
+        entries = p.get("plans")
+        if not entries:
+            if plan_id or accepting_only:
+                excluded["unknown_plan_membership"] += 1
+                continue
+            if spec and spec not in fold(str(p.get("specialty", "")) + " " + str(p.get("provider_type", ""))):
+                continue
+            out.append(p)
+            continue
+        keep = []
+        for e in entries:
+            if plan_id and not _plan_matches(e.get("plan_id"), plan_id):
+                continue
+            if spec and spec not in fold(json.dumps(e.get("specialties", []))):
+                continue
+            if accepting_only and not (e.get("accepting_new_patients") or "").strip().lower().startswith("accepting"):
+                continue
+            keep.append(e)
+        if not keep:
+            excluded["no_matching_plan_entry"] += 1
+            continue
+        q = dict(p)
+        if plan_id or accepting_only or spec:
+            q["plans"] = keep
+            q["filtered_to_matching_plan_entries"] = True
+        out.append(q)
+    return out, excluded
+
+
 def provider_search(provider_type: str, name: str = "", zip_code: str = "", address: str = "",
                     specialty: str = "", plan_id: str = "", accepting_only: bool = False, limit: int = 25) -> dict:
     ptype = _ptype(provider_type)
@@ -257,18 +306,14 @@ def provider_search(provider_type: str, name: str = "", zip_code: str = "", addr
             continue
         merged[key] = p
     results = list(merged.values())
-    if specialty:
-        s = fold(specialty)
-        results = [p for p in results if s in fold(json.dumps(p.get("plans", [])) + " " + str(p.get("specialty", "")))]
-    if plan_id:
-        pid = plan_id.upper()[:9]
-        results = [p for p in results if not p.get("plans") or any((x.get("plan_id") or "").startswith(pid) for x in p["plans"])]
-    if accepting_only:
-        results = [p for p in results if any((x.get("accepting_new_patients") or "").lower().startswith("accepting")
-                                             for x in p.get("plans", []))]
+    results, excluded = filter_providers(results, specialty=specialty, plan_id=plan_id, accepting_only=accepting_only)
     return {"request": params, "filters": {k: v for k, v in dict(specialty=specialty, plan_id=plan_id,
                                                                  accepting_only=accepting_only).items() if v},
             "api_records": len(data.get("data") or []), "matches": len(results), "results": results[:limit],
+            "excluded": excluded,
+            "excluded_note": ("Records without per-plan data (most facility records) have unknown plan participation "
+                              "and are excluded when plan_id or accepting_only is used; search without those filters "
+                              "and confirm with the plan.") if excluded.get("unknown_plan_membership") else None,
             "truncated": len(results) > limit, "source_url": url, "retrieved_at": resp.fetched_at,
             "source": "MedCare Partners public provider search (the API behind mcpartnerstx.com/provider-directory-search/)",
             "caution": ("The site states: 'Provider information may change. Please confirm with the provider that they "

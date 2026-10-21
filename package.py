@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 INCLUDE = ["plugins/medcare-resources", ".agents/plugins/marketplace.json", "install.py", "README.md",
-           "THIRD_PARTY_NOTICES.md"]
+           "THIRD_PARTY_NOTICES.md", "CHANGELOG.md"]
 SKIP_PARTS = {"__pycache__", ".pytest_cache", ".DS_Store"}
 
 

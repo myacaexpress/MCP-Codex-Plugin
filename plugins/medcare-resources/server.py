@@ -250,10 +250,15 @@ def zip_to_county(zip_code: str):
 def cms_find_plans(year: int, state: str = "", county: str = "", zip_code: str = "", plan_type: str = "",
                    organization: str = "", snp: str = "", include_pdp: bool = True, part_d_only: bool = False,
                    limit: int = 150):
-    if zip_code:
+    if zip_code and not (state and county):
         zc = _wrap(cms.zip_counties, zip_code)
         if not zc["counties"]:
             raise ToolError("ZIP not found in the Census ZCTA file; give state and county instead.")
+        if len(zc["counties"]) > 1:
+            return {"status": "county_required", "zip_lookup": zc,
+                    "detail": ("This ZIP spans more than one county and plan availability is by county. Ask which "
+                               "county the person lives in, then call again with state and county."),
+                    "candidate_counties": [f"{c['county']}, {c['state']}" for c in zc["counties"]]}
         top = zc["counties"][0]
         state, county = top["state"], top["county"]
         extra = {"zip_lookup": zc}
@@ -356,6 +361,44 @@ def plan_eligibility_criteria(plan_id: str, year: int, zip_code: str = "", count
                  qualifying_conditions, medicaid_status)
 
 
+@mcp.tool("cms_refresh_data",
+          "Re-check the cached CMS data against cms.gov / data.cms.gov now and re-download only if CMS published a new "
+          "or revised file (force=true always re-downloads). The cache is also re-checked automatically when older "
+          "than 7 days (MEDCARE_CMS_MAX_AGE_DAYS). Downloads up to ~25 MB.",
+          schema({"year": YEAR, "dataset": {**S, "enum": ["landscape", "part_d", "all"]}, "force": B}, ["year"]),
+          read_only=False)
+def cms_refresh_data(year: int, dataset: str = "all", force: bool = False):
+    out = {"year": year}
+    if dataset in ("landscape", "all"):
+        before = _safe_meta(cms.landscape_db, year)
+        _wrap(cms.landscape_db, year, True, force)
+        after = cms.landscape_source(year)
+        out["landscape"] = {"before": before, "after": {k: after.get(k) for k in (
+            "source_url", "data_last_updated", "http_last_modified", "retrieved_at", "last_checked_at", "freshness")},
+            "changed": before.get("sha256") != after.get("sha256")}
+    if dataset in ("part_d", "all"):
+        before = _safe_meta(cms.puf_db, year)
+        _wrap(cms.puf_db, year, True, force)
+        after = cms.puf_source(year)
+        out["part_d"] = {"before": before, "after": {k: after.get(k) for k in (
+            "source_url", "file_date", "retrieved_at", "last_checked_at", "freshness")},
+            "changed": before.get("file_date") != after.get("file_date")}
+    return out
+
+
+def _safe_meta(fn, year):
+    import sqlite3
+    from medcare.cms import _cms_dir
+    pattern = "landscape_v2_%d_*.sqlite" if fn is cms.landscape_db else "partd_puf_%d_*.sqlite"
+    files = sorted(_cms_dir().glob(pattern % year))
+    if not files:
+        return {"cached": False}
+    conn = sqlite3.connect(files[-1])
+    meta = dict(conn.execute("select key, value from meta").fetchall())
+    conn.close()
+    return {k: meta.get(k) for k in ("sha256", "file_date", "data_last_updated", "retrieved_at", "last_checked_at")}
+
+
 @mcp.tool("source_status", "Versions and freshness of every data source this plugin uses (MedCare snapshot date, CMS "
           "Landscape and Part D file versions in the local cache, cache location) and the plugin's known limitations.",
           schema({"check_cms": {**B, "description": "Load/refresh CMS metadata now (may download ~25 MB on first use)."}}))
@@ -368,11 +411,22 @@ def source_status(check_cms: bool = False):
     if check_cms:
         out["cms_landscape_2027"] = _wrap(cms.landscape_source, 2027)
         out["cms_part_d_2027"] = _wrap(cms.puf_source, 2027)
+    out["access_modes"] = {
+        "automated_live": "Tool fetched the source during this call (e.g. provider search, Formulary Navigator, CMS, "
+                          "NPPES, RxNav, verified carrier PDFs).",
+        "snapshot": "Bundled MedCare catalog/document index; date in medcare_catalog.catalog_generated_at.",
+        "browser_handoff": "Link for a person (or Codex's browser) to open. The tool did NOT retrieve or read it; "
+                           "nothing from it is evidence until someone checks it (Medicare.gov Plan Compare, vendor "
+                           "directories, MedImpact price tool)."}
+    out["cms_freshness_policy"] = (f"CMS caches are re-checked when older than {cms.max_age_days():g} days or via "
+                                   "cms_refresh_data.")
     out["live_sources"] = {"medcare_provider_search": lookups.PROVIDER_API, "formulary_navigator": lookups.NAV_BASE,
                            "nppes": lookups.NPPES_API, "rxnav": cms.RXNAV, "cms_landscape_page": cms.LANDSCAPE_PAGE,
                            "cms_data_catalog": cms.CMS_CATALOG}
     out["limitations"] = [
-        "Medicare.gov Plan Compare is not scraped (interactive, bot-protected); links are browser hand-offs.",
+        "Medicare.gov Plan Compare is not scraped (interactive, bot-protected); links are browser hand-offs whose deep-link "
+        "format is unverified.",
+        "Supported on macOS and Linux (POSIX launcher). Windows is not supported by this release.",
         "Competitor Summary of Benefits URLs must be found (web search/browser) and then verified with plan_document_retrieve.",
         "Vendor directories (Delta Dental, VSP, ASH, Silver&Fit) and MedImpact pricing are browser-only.",
         "MedCare online enrollment, provider portal, OTC catalog, hearing/vision/healthy-food documents and several "

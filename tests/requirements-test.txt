@@ -1,0 +1,3 @@
+# Test-only dependencies (the plugin itself needs none). Pinned to the MCP SDK v1 API used by tests/test_live.py.
+pytest>=8,<9
+mcp>=1.20,<2

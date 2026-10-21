@@ -119,13 +119,30 @@ class Server:
 
     # ------------------------------------------------------------------ handlers
     def _call_tool(self, mid, params):
+        try:
+            self._call_tool_inner(mid, params)
+        except Exception as err:  # last-resort guard: every request gets a response
+            traceback.print_exc(file=sys.stderr)
+            self._error(mid, -32603, f"Internal error: {type(err).__name__}")
+
+    def _call_tool_inner(self, mid, params):
+        if not isinstance(params, dict):
+            self._error(mid, -32602, "Invalid params: 'params' must be an object.")
+            return
         name = params.get("name")
+        if not isinstance(name, str):
+            self._error(mid, -32602, "Invalid params: 'name' must be a string.")
+            return
+        arguments = params.get("arguments")
+        if arguments is not None and not isinstance(arguments, dict):
+            self._error(mid, -32602, "Invalid params: 'arguments' must be an object.")
+            return
         tool = self.tools.get(name)
         if tool is None:
             self._error(mid, -32602, f"Unknown tool: {name}")
             return
         try:
-            args = self._validate(tool.input_schema, params.get("arguments") or {})
+            args = self._validate(tool.input_schema, arguments or {})
             result = tool.func(**args)
             if not isinstance(result, dict):
                 result = {"result": result}
@@ -134,7 +151,7 @@ class Server:
                 text = text[:400_000] + "\n… [truncated; narrow the query or lower 'limit']"
             self._result(mid, {"content": [{"type": "text", "text": text}], "structuredContent": result,
                                "isError": False})
-        except (ToolError, ValueError, KeyError) as err:
+        except (ToolError, ValueError, KeyError, TypeError) as err:
             msg = str(err) or type(err).__name__
             self._result(mid, {"content": [{"type": "text", "text": f"Error: {msg}"}], "isError": True})
         except Exception as err:  # unexpected: report without crashing the server
@@ -142,15 +159,38 @@ class Server:
             msg = f"{type(err).__name__}: {err}"
             self._result(mid, {"content": [{"type": "text", "text": f"Error: {msg}"}], "isError": True})
 
-    def handle(self, msg: dict):
-        if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
+    def handle(self, msg):
+        try:
+            self._handle(msg)
+        except Exception as err:  # never let one bad message kill the server
+            traceback.print_exc(file=sys.stderr)
+            mid = msg.get("id") if isinstance(msg, dict) else None
             if isinstance(msg, dict) and "id" in msg:
-                self._error(msg.get("id"), -32600, "Invalid Request")
+                self._error(mid, -32603, f"Internal error: {type(err).__name__}")
+
+    def _handle(self, msg):
+        if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
+            mid = msg.get("id") if isinstance(msg, dict) else None
+            self._error(mid if isinstance(mid, (str, int)) else None, -32600, "Invalid Request")
             return
-        method, mid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+        method, mid = msg.get("method"), msg.get("id")
+        if "id" in msg and not (mid is None or isinstance(mid, (str, int))) or isinstance(mid, bool):
+            self._error(None, -32600, "Invalid Request: id must be a string or number.")
+            return
         if method is None:
             return  # a response to something we never send
+        if not isinstance(method, str):
+            if "id" in msg:
+                self._error(mid, -32600, "Invalid Request: method must be a string.")
+            return
+        params = msg.get("params")
+        if params is None:
+            params = {}
         is_request = "id" in msg
+        if not isinstance(params, dict):
+            if is_request:
+                self._error(mid, -32602, "Invalid params: 'params' must be an object.")
+            return
         if method == "initialize":
             requested = params.get("protocolVersion")
             self.protocol_version = requested if requested in SUPPORTED_VERSIONS else SUPPORTED_VERSIONS[0]
@@ -166,12 +206,14 @@ class Server:
                                           "inputSchema": t.input_schema, "annotations": t.annotations}
                                          for t in self.tools.values()]})
         elif method == "tools/call":
+            if not is_request:
+                return
             self._pool.submit(self._call_tool, mid, params)
-        elif method in ("resources/list",):
+        elif method == "resources/list":
             self._result(mid, {"resources": []})
-        elif method in ("resources/templates/list",):
+        elif method == "resources/templates/list":
             self._result(mid, {"resourceTemplates": []})
-        elif method in ("prompts/list",):
+        elif method == "prompts/list":
             self._result(mid, {"prompts": []})
         elif method.startswith("notifications/"):
             return
@@ -192,6 +234,8 @@ class Server:
                 self._error(None, -32700, "Parse error")
                 continue
             if isinstance(msg, list):
+                if not msg:
+                    self._error(None, -32600, "Invalid Request: empty batch")
                 for m in msg:
                     self.handle(m)
             else:

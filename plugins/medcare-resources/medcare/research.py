@@ -55,6 +55,8 @@ def medicare_gov_link(plan_id: str, year: int, zip_code: str = "", fips: str = "
     return {"plan_details_url": f"{PLAN_COMPARE}#/plan-details/{year}-{contract}-{pbp}-{seg_num}?" + "&".join(q),
             "plan_compare_home": PLAN_COMPARE,
             "status": "browser_handoff",
+            "access_mode": "browser_handoff", "retrieved_by_tool": False, "evidence": False,
+            "link_format_verified": False,
             "note": ("Medicare.gov Plan Compare is an interactive site; this tool does not scrape it. Open the link in a "
                      "browser (no sign-in needed) to view plan details. If the deep link does not open the plan, start "
                      "at Plan Compare, choose the year, enter the ZIP/county and find the exact contract-plan-segment.")}
@@ -92,16 +94,24 @@ def plan_research(plan_id: str, year: int, zip_code: str = "", county: str = "",
         out["cms_part_d"] = {"status": "unavailable", "error": str(err)}
     area_check = None
     if zip_code or county:
-        counties = cms.zip_counties(zip_code)["counties"] if zip_code else [{"county": county, "state": state.upper()}]
+        if county:
+            st = state.upper() or (next((c["state"] for c in cms.zip_counties(zip_code)["counties"]), "") if zip_code else "")
+            counties = [{"county": re.sub(r"\s+county$", "", county.strip(), flags=re.I), "state": st}]
+        else:
+            counties = cms.zip_counties(zip_code)["counties"]
         area_check = []
         for c in counties:
             hits = [s["plan_id"] for s in segments
-                    if c["county"] in s["service_area"].get(c.get("state") or "", [])
+                    if c["county"].lower() in {x.lower() for x in s["service_area"].get(c.get("state") or "", [])}
                     or "All Counties" in s["service_area"].get(c.get("state") or "", [])]
             area_check.append({"county": c["county"], "state": c.get("state"),
                                "share_of_zip_area": c.get("share_of_zcta_land_area"),
                                "plan_offered_in_county_per_cms": bool(hits), "segments": hits})
         out["service_area_check"] = area_check
+        covered = [a["plan_offered_in_county_per_cms"] for a in area_check]
+        out["service_area_determination"] = ("offered_in_all_candidate_counties" if all(covered) else
+                                             "not_offered_in_any_candidate_county" if not any(covered) else
+                                             "ambiguous_zip_spans_covered_and_uncovered_counties_ask_county")
     first = segments[0]
     fips = ""
     if zip_code:
@@ -119,6 +129,8 @@ def plan_research(plan_id: str, year: int, zip_code: str = "", county: str = "",
         out["document_status"] = "carrier_document_url_needed"
         pid = f"{contract}-{pbp}"
         out["find_summary_of_benefits"] = {
+            "access_mode": "web_search_or_browser_handoff",
+            "note": "The tool has not found or read the competitor document yet; these are search leads only.",
             "organization": first.get("organization"), "parent_organization": first.get("parent_organization"),
             "official_domains_known": domains or None,
             "search_queries": [f'"{pid}" "{year}" "Summary of Benefits"' + (f" site:{domains[0]}" if domains else ""),
@@ -134,56 +146,102 @@ def plan_research(plan_id: str, year: int, zip_code: str = "", county: str = "",
 
 
 # ---------------------------------------------------------------- document retrieval
+_DOC_CODE = re.compile(r"\b([HRS]\d{4})_(SB|EOC|ANOC)(\d{3})(20\d\d)", re.I)
+_TITLE_YEAR = re.compile(r"\b(20\d\d)\s+(?:summary\s+of\s+benefits|resumen\s+de\s+beneficios|evidence\s+of\s+coverage|"
+                         r"evidencia\s+de\s+cobertura|annual\s+notice)|(?:summary\s+of\s+benefits|evidence\s+of\s+coverage|"
+                         r"resumen\s+de\s+beneficios|evidencia\s+de\s+cobertura)\s*(?:for|para)\s*(20\d\d)", re.I)
+_DATE_YEAR = re.compile(r"january\s+1\s*,?\s*(20\d\d)|1\s+de\s+enero\s+de\s+(20\d\d)|"
+                        r"january\s+1\s*(?:-|through|to)\s*december\s+31\s*,?\s*(20\d\d)|"
+                        r"del\s+1\s+de\s+enero\s+de\s+(20\d\d)\s+al\s+31\s+de\s+diciembre\s+de\s+(20\d\d)", re.I)
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").replace("\u2011", "-").replace("\u2013", "-").replace("\u2014", "-")
+
+
+def resolve_year(pages: list[str]) -> dict:
+    """Determine the document's coverage year from its title area. Ambiguity is reported, never guessed.
+
+    Title area = first page (or the first page that has a title-year statement among pages 1-2).
+    Document codes such as H5767_SB0012027_M also carry the year.
+    """
+    title_years, title_page = set(), None
+    for i, pg in enumerate(pages[:2]):
+        found = {a or b for a, b in _TITLE_YEAR.findall(_norm(pg))}
+        if found:
+            title_years, title_page = found, i + 1
+            break
+    head = _norm(" ".join(pages[:2]))
+    code_years = {m[3] for m in _DOC_CODE.findall(head)}
+    date_years = {y for groups in _DATE_YEAR.findall(head) for y in groups if y}
+    evidence = title_years | code_years
+    if evidence:
+        status = "resolved" if len(evidence) == 1 else "ambiguous_conflicting_years"
+    elif date_years:
+        status = "resolved_from_effective_dates" if len(date_years) == 1 else "ambiguous_conflicting_years"
+        evidence = date_years
+    else:
+        status = "not_found"
+    return {"status": status, "year": next(iter(evidence)) if len(evidence) == 1 else None,
+            "title_years": sorted(title_years), "title_page": title_page, "document_code_years": sorted(code_years),
+            "effective_date_years": sorted(date_years)}
+
+
 def _verify_identity(pages: list[str], plan_id: str, year: int, doc_kind: str = "summary_of_benefits") -> dict:
     contract, pbp, seg = cms.parse_plan_id(plan_id)
-    head = re.sub(r"\s+", " ", " ".join(pages[:4])).replace("‑", "-").replace("–", "-")
-    full = re.sub(r"\s+", " ", " ".join(pages)).replace("‑", "-").replace("–", "-")
+    head = _norm(" ".join(pages[:4]))
+    full = _norm(" ".join(pages))
     checks = {}
-    kind_rx = {"summary_of_benefits": r"summary\s+of\s+benefits|resumen\s+de\s+beneficios",
-               "evidence_of_coverage": r"evidence\s+of\s+coverage|evidencia\s+de\s+cobertura",
-               "annual_notice_of_changes": r"annual\s+notice\s+of\s+change"}[doc_kind]
+    kind_rx = {"summary_of_benefits": r"summary\s+of\s+benefits|resumen\s+de\s+beneficios|_SB\d{3}20\d\d",
+               "evidence_of_coverage": r"evidence\s+of\s+coverage|evidencia\s+de\s+cobertura|_EOC\d{3}20\d\d",
+               "annual_notice_of_changes": r"annual\s+notice\s+of\s+change|_ANOC\d{3}20\d\d"}[doc_kind]
     checks["document_type"] = bool(re.search(kind_rx, head, re.I))
-    doc_years = set(re.findall(r"\b(20\d\d)\s+(?:summary|resumen|evidence|evidencia|annual)", head, re.I)) | \
-        set(re.findall(r"(?:summary of benefits|evidence of coverage|resumen de beneficios|evidencia de cobertura)"
-                       r"\s*(?:for|para)?\s*(20\d\d)", head, re.I))
-    date_years = set(re.findall(r"january\s+1\s*,?\s*(20\d\d)", head, re.I)) | \
-        set(re.findall(r"1\s+de\s+enero\s+de\s+(20\d\d)", head, re.I)) | \
-        set(re.findall(r"january\s+1\s*(?:-|–|through|to)\s*december\s+31\s*,?\s*(20\d\d)", head, re.I))
-    checks["document_years_found"] = sorted(doc_years)
-    checks["effective_date_years_found"] = sorted(date_years)
-    checks["year_matches"] = (str(year) in doc_years) or (not doc_years and str(year) in date_years)
-    other = sorted(doc_years - {str(year)})
-    if other:
-        checks["other_years_in_title_area"] = other
+    yr = resolve_year(pages)
+    checks["year_resolution"] = yr
+    checks["year_matches"] = yr["year"] == str(year) and yr["status"].startswith("resolved")
+    if yr["status"] == "ambiguous_conflicting_years":
+        checks["year_problem"] = "Title area names more than one coverage year; cannot attribute document to one year."
     ids = set()
     for c, p, s in re.findall(r"\b([HRS]\d{4})[-_ ](\d{3})(?:[-_](\d{1,3}))?(?![\d-])", full):
         ids.add((c.upper(), p, str(int(s)).zfill(3) if s else None))
+    for c, _kind, p, _y in _DOC_CODE.findall(full):
+        ids.add((c.upper(), p, None))
     plan_ids_in_doc = sorted({f"{c}-{p}" + (f"-{s}" if s else "") for c, p, s in ids})
     checks["plan_ids_in_document"] = plan_ids_in_doc[:40]
     checks["contract_pbp_found"] = any(c == contract and p == pbp for c, p, _ in ids)
     seg_listed = {s for c, p, s in ids if c == contract and p == pbp and s}
-    distinct_plans = {(c, p) for c, p, _ in ids}
-    checks["multiple_plans_in_document"] = len(distinct_plans) > 1
-    seg_status = "not_needed"
+    checks["multiple_plans_in_document"] = len({(c, p) for c, p, _ in ids}) > 1
     try:
-        land = cms.plan_landscape(year, f"{contract}-{pbp}")
-        all_segs = land["segments_in_landscape"]
+        all_segs = cms.plan_landscape(year, f"{contract}-{pbp}")["segments_in_landscape"]
     except (net.FetchError, cms.CMSDataError):
         all_segs = []
-    want = seg or "000"
-    if seg_listed:
+    resolved_seg = None
+    if seg is None and len(all_segs) == 1:
+        want = all_segs[0].rsplit("-", 1)[1]
+    else:
+        want = seg
+    if want is None:
+        seg_status = "segment_required_multiple_segments_in_cms" if len(all_segs) > 1 else "segment_unconfirmed"
+    elif len(seg_listed) > 1:
+        seg_status = ("multiple_segments_in_document_column_review_required" if want in seg_listed
+                      else "segment_mismatch")
+    elif seg_listed:
         seg_status = "segment_matches" if want in seg_listed else "segment_mismatch"
+        resolved_seg = want if want in seg_listed else None
     elif len(all_segs) == 1 and all_segs[0].endswith("-" + want):
         seg_status = "segment_inferred_single_segment_in_cms"
+        resolved_seg = want
     elif len(all_segs) > 1:
         seg_status = "segment_ambiguous_multiple_segments_in_cms"
     else:
         seg_status = "segment_unconfirmed"
     checks["segment_check"] = seg_status
+    checks["segments_listed_in_document"] = sorted(seg_listed)
     checks["cms_segments"] = all_segs
-    ok = checks["document_type"] and checks["year_matches"] and checks["contract_pbp_found"] and \
-        seg_status in ("segment_matches", "segment_inferred_single_segment_in_cms")
+    ok = bool(checks["document_type"] and checks["year_matches"] and checks["contract_pbp_found"] and resolved_seg)
     checks["identity_verified"] = ok
+    checks["verified_plan_id"] = f"{contract}-{pbp}-{resolved_seg}" if ok else None
+    checks["verified_year"] = year if ok else None
     if checks["multiple_plans_in_document"]:
         checks["column_review_required"] = ("Document lists several plans; make sure every figure is read from the "
                                             f"{contract}-{pbp} column/section.")
@@ -237,6 +295,8 @@ def plan_document_retrieve(url: str, plan_id: str, year: int, document_type: str
               "cms_crosscheck": _cms_crosscheck(pages, plan_id, year)}
     status = "verified_document" if checks["identity_verified"] else "unverified_document"
     record["status"] = status
+    record["verified_plan_id"] = checks["verified_plan_id"]
+    record["verified_year"] = checks["verified_year"]
     key = f"{cms.fmt_plan(*cms.parse_plan_id(plan_id))}_{year}_{document_type}_{resp.sha256[:12]}"
     (_sb_dir() / f"{key}.json").write_text(json.dumps({**record, "pages": pages}))
     out = dict(record)
@@ -278,30 +338,58 @@ def requests_join(base: str, href: str) -> str:
     return urljoin(base, href)
 
 
-def _cached_docs(plan_id: str, year: int) -> list[dict]:
+def _requested_plan(plan_id: str, year: int) -> tuple[str | None, str]:
+    """Exact contract-plan-segment for a request, or None when the segment is ambiguous."""
     contract, pbp, seg = cms.parse_plan_id(plan_id)
+    if seg:
+        return f"{contract}-{pbp}-{seg}", "explicit"
+    try:
+        segs = cms.plan_landscape(year, f"{contract}-{pbp}")["segments_in_landscape"]
+    except (net.FetchError, cms.CMSDataError):
+        segs = []
+    if len(segs) == 1:
+        return segs[0], "single_segment_in_cms"
+    return None, ("multiple_segments_in_cms" if segs else "plan_not_in_cms_landscape_for_year")
+
+
+_BUNDLED_VERIFY: dict = {}
+
+
+def _cached_docs(plan_id: str, year: int) -> list[dict]:
+    """Documents whose verified identity is exactly this contract-plan-segment AND this coverage year."""
+    want, how = _requested_plan(plan_id, year)
+    contract, pbp, _ = cms.parse_plan_id(plan_id)
     docs = []
     if contract == "H5767":
         s = catalog._load()
         for sha, d in s["docs"].items():
-            if f"{contract}-{pbp}" in d["plan_ids"] and d["category"] in ("summary_of_benefits", "evidence_of_coverage") \
-                    and d.get("language") != "es":
-                res = s["by_id"].get(d["resource_id"], {})
-                if res.get("status") != "available":
-                    continue
-                docs.append({"source": "bundled_medcare_catalog", "url": d["url"], "document_type": d["category"],
-                             "sha256": sha, "status": "verified_document", "pages": d["pages"],
-                             "retrieved_at": res.get("document", {}).get("fetched_at"), "title": d["title"]})
+            if f"{contract}-{pbp}" not in d["plan_ids"] or d["category"] not in ("summary_of_benefits", "evidence_of_coverage") \
+                    or d.get("language") == "es":
+                continue
+            res = s["by_id"].get(d["resource_id"], {})
+            if res.get("status") != "available":
+                continue
+            key = (sha, plan_id.upper(), year)
+            if key not in _BUNDLED_VERIFY:
+                _BUNDLED_VERIFY[key] = _verify_identity(d["pages"], want or plan_id, year, d["category"])
+            v = _BUNDLED_VERIFY[key]
+            ok = bool(want) and v["identity_verified"] and v["verified_plan_id"] == want and v["verified_year"] == year
+            docs.append({"source": "bundled_medcare_catalog", "url": d["url"], "document_type": d["category"],
+                         "sha256": sha, "status": "verified_document" if ok else "not_verified_for_request",
+                         "pages": d["pages"], "verification": v, "requested": {"plan": want, "year": year,
+                                                                               "segment_resolution": how},
+                         "retrieved_at": res.get("document", {}).get("fetched_at"), "title": d["title"]})
     for f in sorted(_sb_dir().glob(f"{contract}-{pbp}*_{year}_*.json")):
         try:
             d = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
-        if seg and not d["plan_id"].startswith(f"{contract}-{pbp}"):
-            continue
+        ok = (d.get("status") == "verified_document" and bool(want) and d.get("verified_plan_id") == want
+              and d.get("verified_year") == year)
         docs.append({"source": "retrieved_cache", "url": d["url"], "document_type": d["document_type"],
-                     "sha256": d["sha256"], "status": d["status"], "pages": d["pages"],
-                     "retrieved_at": d["retrieved_at"], "verification": d["verification"]})
+                     "sha256": d["sha256"], "status": "verified_document" if ok else "not_verified_for_request",
+                     "pages": d["pages"], "retrieved_at": d["retrieved_at"], "verification": d["verification"],
+                     "requested": {"plan": want, "year": year, "segment_resolution": how}})
     return docs
 
 
@@ -312,7 +400,9 @@ def plan_document_search(plan_id: str, year: int, query: str, document_type: str
         docs = [d for d in docs if d["document_type"] == document_type]
     usable = [d for d in docs if d["status"] == "verified_document" or include_unverified]
     if not usable:
+        want, how = _requested_plan(plan_id, year)
         return {"plan_id": plan_id, "year": year, "status": "no_verified_document",
+                "segment_resolution": how, "resolved_plan_id": want,
                 "detail": ("No verified plan document is available for this plan/year yet. Use plan_research to find "
                            "the official PDF, then plan_document_retrieve to verify it."),
                 "documents_seen": [{k: d[k] for k in ("url", "status", "document_type")} for d in docs]}
@@ -390,6 +480,43 @@ def compare_plans(plan_ids: list[str], year: int, topics: list[str] | None = Non
 
 
 # ---------------------------------------------------------------- eligibility criteria
+def service_area_assessment(area: dict, zip_code: str = "", county: str = "", state: str = "") -> dict:
+    """County-level service-area check. A ZIP spanning covered and uncovered counties is 'unknown'."""
+    out = {"criterion": "Lives in the plan's service area", "service_area": area,
+           "supplied_fact": {"zip": zip_code or None, "county": county or None, "state": state or None}}
+    if county:
+        st = (state or "").upper()
+        if not st and zip_code:
+            st = next((c["state"] for c in cms.zip_counties(zip_code)["counties"]), "")
+        if not st:
+            out.update(assessment="unknown", detail="Give the state with the county.")
+            return out
+        name = re.sub(r"\s+county$", "", county.strip(), flags=re.I)
+        covered = name.lower() in {c.lower() for c in area.get(st, [])} or "All Counties" in area.get(st, [])
+        out.update(counties_considered=[{"county": name, "state": st, "covered": covered}],
+                   assessment="appears_met" if covered else "appears_not_met")
+        return out
+    if zip_code:
+        rows = cms.zip_counties(zip_code)["counties"]
+        considered = [{"county": c["county"], "state": c["state"], "share_of_zip_area": c["share_of_zcta_land_area"],
+                       "covered": c["county"] in area.get(c["state"], []) or "All Counties" in area.get(c["state"], [])}
+                      for c in rows]
+        out["counties_considered"] = considered
+        if not considered:
+            out.update(assessment="unknown", detail="ZIP not found in the Census ZCTA file; give the county.")
+        elif all(c["covered"] for c in considered):
+            out["assessment"] = "appears_met"
+        elif not any(c["covered"] for c in considered):
+            out["assessment"] = "appears_not_met"
+        else:
+            out.update(assessment="unknown_zip_spans_covered_and_uncovered_counties",
+                       detail="This ZIP spans counties inside and outside the service area. Ask for the county of "
+                              "residence and re-check with county + state.")
+        return out
+    out["assessment"] = "unknown"
+    return out
+
+
 CONDITION_ALIASES = {"diabetes": "DiabetesMellitus", "diabetes mellitus": "DiabetesMellitus",
                      "chf": "ChronicHeartFailure", "heart failure": "ChronicHeartFailure",
                      "chronic heart failure": "ChronicHeartFailure", "congestive heart failure": "ChronicHeartFailure",
@@ -408,25 +535,31 @@ def plan_eligibility_criteria(plan_id: str, year: int, county: str = "", state: 
     p = land["plans"][0]
     criteria = []
     is_pdp = p["category"] == "PDP"
-    criteria.append({"criterion": "Medicare Part A and Part B" if not is_pdp else "Medicare Part A and/or Part B",
+    if is_pdp:
+        # PDP: entitled to Part A OR enrolled in Part B.
+        if has_part_a is True or has_part_b is True:
+            ab = "appears_met"
+        elif has_part_a is False and has_part_b is False:
+            ab = "appears_not_met"
+        else:
+            ab = "unknown"
+        ab_label = "Medicare Part A and/or Part B (either is sufficient for a PDP)"
+    else:
+        # MA / SNP / cost plans: Part A AND Part B.
+        if has_part_a is False or has_part_b is False:
+            ab = "appears_not_met"
+        elif has_part_a is True and has_part_b is True:
+            ab = "appears_met"
+        else:
+            ab = "unknown"
+        ab_label = "Medicare Part A and Part B (both required)"
+    criteria.append({"criterion": ab_label,
                      "source": "Standard Medicare Advantage/PDP rule; see plan EOC Chapter 1 'Eligibility requirements'.",
-                     "supplied_fact": {"has_part_a": has_part_a, "has_part_b": has_part_b},
-                     "assessment": ("unknown" if has_part_a is None or (has_part_b is None and not is_pdp) else
-                                    "appears_met" if has_part_a and (has_part_b or is_pdp) else "appears_not_met")})
+                     "supplied_fact": {"has_part_a": has_part_a, "has_part_b": has_part_b}, "assessment": ab})
     area = p["service_area"]
-    supplied_counties = []
-    if zip_code:
-        supplied_counties = [(c["county"], c["state"]) for c in cms.zip_counties(zip_code)["counties"]]
-    elif county:
-        supplied_counties = [(re.sub(r"\s+county$", "", county, flags=re.I), (state or "").upper())]
-    in_area = None
-    if supplied_counties:
-        in_area = any(c in area.get(s, []) or "All Counties" in area.get(s, []) for c, s in supplied_counties)
-    criteria.append({"criterion": "Lives in the plan's service area", "service_area": area,
-                     "source": "CMS Landscape " + cms.landscape_source(year).get("data_last_updated", ""),
-                     "supplied_fact": {"zip": zip_code or None, "county": county or None,
-                                       "counties_considered": supplied_counties or None},
-                     "assessment": "unknown" if in_area is None else ("appears_met" if in_area else "appears_not_met")})
+    area_crit = service_area_assessment(area, zip_code=zip_code, county=county, state=state)
+    area_crit["source"] = "CMS Landscape " + cms.landscape_source(year).get("data_last_updated", "")
+    criteria.append(area_crit)
     if p["snp"] == "Yes":
         snp_type = p["snp_type"]
         c = {"criterion": f"Special Needs Plan requirement: {snp_type}", "snp_type": snp_type}

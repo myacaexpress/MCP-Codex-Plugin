@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import json
 import re
 import sqlite3
@@ -96,20 +97,8 @@ def _discover_landscape(year: int) -> str:
     return "https://www.cms.gov" + links[-1][0]
 
 
-def landscape_db(year: int, refresh: bool = False) -> sqlite3.Connection:
-    with _LOCK:
-        existing = sorted(_cms_dir().glob(f"landscape_v2_{year}_*.sqlite"))
-        if existing and not refresh:
-            conn = sqlite3.connect(existing[-1], check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            return conn
-        url = _discover_landscape(year)
-        stamp = re.search(r"-(\d{6})\.zip$", url).group(1)
-        target = _cms_dir() / f"landscape_v2_{year}_{stamp}.sqlite"
-        if target.exists() and refresh:
-            conn = sqlite3.connect(target, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            return conn
+def _build_landscape(year: int, url: str, target: Path) -> None:
+    if True:
         resp = net.fetch(url, hosts=CMS_HOSTS, max_bytes=120_000_000, timeout=180)
         z = zipfile.ZipFile(io.BytesIO(resp.body))
         csv_name = next((n for n in z.namelist() if n.lower().endswith(".csv")), None)
@@ -153,18 +142,99 @@ def landscape_db(year: int, refresh: bool = False) -> sqlite3.Connection:
         meta = {"source_url": url, "source_page": LANDSCAPE_PAGE, "year": str(year),
                 "data_last_updated": updated or "", "http_last_modified": resp.headers.get("last-modified", ""),
                 "retrieved_at": resp.fetched_at, "sha256": resp.sha256, "file": csv_name}
+        meta["last_checked_at"] = meta["retrieved_at"]
         conn.executemany("insert into meta values (?,?)", list(meta.items()))
         conn.commit()
         conn.close()
         tmp.replace(target)
-        conn = sqlite3.connect(target, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
+
+
+def _connect(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _set_meta(path: Path, **values) -> None:
+    conn = sqlite3.connect(path)
+    conn.executemany("insert or replace into meta values (?,?)", [(k, str(v)) for k, v in values.items()])
+    conn.commit()
+    conn.close()
+
+
+def _age_days(meta: dict, key: str = "last_checked_at") -> float | None:
+    value = meta.get(key) or meta.get("retrieved_at")
+    try:
+        then = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return (datetime.now(timezone.utc) - then).total_seconds() / 86400
+
+
+def max_age_days() -> float:
+    try:
+        return float(os.environ.get("MEDCARE_CMS_MAX_AGE_DAYS", "7"))
+    except ValueError:
+        return 7.0
+
+
+_REFRESH_ERRORS: dict = {}
+
+
+def landscape_db(year: int, refresh: bool = False, force: bool = False) -> sqlite3.Connection:
+    """Cached Landscape DB with a freshness policy.
+
+    The cache is re-checked against cms.gov when it is older than MEDCARE_CMS_MAX_AGE_DAYS (default 7)
+    or when refresh=True. It is re-downloaded only if CMS published a new file or the file's
+    Last-Modified changed (CMS revises the same file name, e.g. 10/18 star ratings), or force=True.
+    If cms.gov is unreachable the existing cache is used and the failure is disclosed in the source.
+    """
+    with _LOCK:
+        existing = sorted(_cms_dir().glob(f"landscape_v2_{year}_*.sqlite"))
+        current = existing[-1] if existing else None
+        if current and not refresh and not force:
+            age = _age_days(_meta(_connect(current)))
+            if age is not None and age < max_age_days():
+                return _connect(current)
+        try:
+            url = _discover_landscape(year)
+            stamp = re.search(r"-(\d{6})\.zip$", url).group(1)
+            head = net.fetch(url, hosts=CMS_HOSTS, max_bytes=1, headers={"Range": "bytes=0-0"}, accept="*/*")
+            remote_lm = head.headers.get("last-modified", "")
+        except (net.FetchError, CMSDataError) as err:
+            if current:
+                _REFRESH_ERRORS[("landscape", year)] = f"{net.now_iso()}: {err}"
+                return _connect(current)
+            raise
+        target = _cms_dir() / f"landscape_v2_{year}_{stamp}.sqlite"
+        if current == target and not force:
+            m = _meta(_connect(current))
+            if remote_lm and remote_lm == m.get("http_last_modified"):
+                _set_meta(current, last_checked_at=net.now_iso())
+                _REFRESH_ERRORS.pop(("landscape", year), None)
+                return _connect(current)
+        _build_landscape(year, url, target)
+        for old in existing:
+            if old != target:
+                old.unlink(missing_ok=True)
+        _REFRESH_ERRORS.pop(("landscape", year), None)
+        return _connect(target)
+
+
+def _freshness(meta: dict, dataset: str, year: int) -> dict:
+    age = _age_days(meta)
+    return {"cache_age_days_since_check": round(age, 2) if age is not None else None,
+            "max_age_days": max_age_days(),
+            "policy": ("Re-checked against CMS automatically when older than max_age_days (env "
+                       "MEDCARE_CMS_MAX_AGE_DAYS) or on demand with cms_refresh_data; re-downloaded only when CMS "
+                       "publishes a new or revised file."),
+            "last_refresh_error": _REFRESH_ERRORS.get((dataset, year))}
 
 
 def landscape_source(year: int) -> dict:
     m = _meta(landscape_db(year))
     return {"dataset": f"CMS CY{year} Medicare Advantage & Part D Landscape", **m,
+            "freshness": _freshness(m, "landscape", year),
             "notice": "CMS: 'The data within are subject to change as contracts are finalized.'"}
 
 
@@ -400,19 +470,40 @@ _PUF_MEMBERS = {
 }
 
 
-def puf_db(year: int, refresh: bool = False) -> sqlite3.Connection:
+def puf_db(year: int, refresh: bool = False, force: bool = False) -> sqlite3.Connection:
+    """Cached Part D PUF with the same freshness policy as landscape_db (new monthly file -> rebuild)."""
     with _LOCK:
         existing = sorted(_cms_dir().glob(f"partd_puf_{year}_*.sqlite"))
-        if existing and not refresh:
-            conn = sqlite3.connect(existing[-1], check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            return conn
-        url, stamp = _discover_puf(year)
+        current = existing[-1] if existing else None
+        if current and not refresh and not force:
+            age = _age_days(_meta(_connect(current)))
+            if age is not None and age < max_age_days():
+                return _connect(current)
+        try:
+            url, stamp = _discover_puf(year)
+        except (net.FetchError, CMSDataError) as err:
+            if current:
+                _REFRESH_ERRORS[("part_d", year)] = f"{net.now_iso()}: {err}"
+                return _connect(current)
+            raise
         target = _cms_dir() / f"partd_puf_{year}_{stamp}.sqlite"
-        if target.exists():
-            conn = sqlite3.connect(target, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            return conn
+        if target.exists() and not force:
+            _set_meta(target, last_checked_at=net.now_iso())
+            _REFRESH_ERRORS.pop(("part_d", year), None)
+            for old in existing:
+                if old != target:
+                    old.unlink(missing_ok=True)
+            return _connect(target)
+        _build_puf(year, url, stamp, target)
+        for old in existing:
+            if old != target:
+                old.unlink(missing_ok=True)
+        _REFRESH_ERRORS.pop(("part_d", year), None)
+        return _connect(target)
+
+
+def _build_puf(year: int, url: str, stamp: str, target: Path) -> None:
+    if True:
         rz = _RemoteZip(url)
         outer = zipfile.ZipFile(rz)
         tmp = target.with_suffix(".tmp")
@@ -456,17 +547,16 @@ def puf_db(year: int, refresh: bool = False) -> sqlite3.Connection:
                 "http_last_modified": rz.last_modified, "retrieved_at": net.now_iso(),
                 "bytes_downloaded": str(rz.read_total), "members": "; ".join(loaded),
                 "record_layout": PUF_LAYOUT}
+        meta["last_checked_at"] = meta["retrieved_at"]
         conn.executemany("insert into meta values (?,?)", list(meta.items()))
         conn.commit()
         conn.close()
         tmp.replace(target)
-        conn = sqlite3.connect(target, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
 
 
 def puf_source(year: int) -> dict:
     m = _meta(puf_db(year))
+    m["freshness"] = _freshness(m, "part_d", year)
     m["notice"] = ("CMS formulary/cost PUF reflects plan submissions; plans can change formularies during "
                    "the year. Not a personal price quote.")
     return m

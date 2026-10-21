@@ -1,6 +1,8 @@
 # MedCare Resources — Codex plugin
 
-A standalone Codex plugin for teams who work with **MedCare Partners Health Plan of Texas** (https://mcpartnerstx.com, contract **H5767**) and who research Medicare plans. It bundles an MCP server with 26 tools and two skills.
+A standalone Codex plugin for teams who work with **MedCare Partners Health Plan of Texas** (https://mcpartnerstx.com, contract **H5767**) and who research Medicare plans. It bundles an MCP server with 27 tools and two skills.
+
+**Version 1.1.0** fixes all nine release blockers from the independent review of 1.0.0 (see `CHANGELOG.md`).
 
 > Independent team tool. It is not affiliated with MedCare Partners, CMS or Medicare.gov. It uses **public information only**: no credentials, no member records, no enrollment or eligibility systems (no MARx), no Wayfinder dependency.
 
@@ -23,9 +25,27 @@ A standalone Codex plugin for teams who work with **MedCare Partners Health Plan
 | Comparison | `compare_plans`: CMS figures, cited benefit lines and drug coverage | CMS and verified documents |
 | Public eligibility criteria | `plan_eligibility_criteria`: Part A/B, service area, SNP conditions; returns *appears met / not met / unknown* for facts the user stated, **never verified** | CMS and the EOC |
 | Provider identity | `npi_lookup` | Live NPPES |
-| Data freshness | `source_status` | — |
+| Data freshness | `source_status`, `cms_refresh_data` (re-check CMS now; caches also auto-re-check after 7 days) | — |
 
 Every result includes provenance: source URL, retrieval or snapshot time, file version and SHA-256 hash.
+
+### Access modes (what is automated and what is not)
+Every catalog resource and hand-off carries an `access_mode`:
+
+| access_mode | Meaning |
+|---|---|
+| `automated_live[:tool]` | The tool fetched the source during the call (provider API, Formulary Navigator, CMS, NPPES, RxNav, verified carrier PDFs). |
+| `snapshot_document` / `site_page` | Bundled MedCare snapshot; check with `medcare_verify_resource`. |
+| `browser_handoff` | **Not retrieved or read by the tool.** A link for a person (or Codex's own browser) to open: Medicare.gov Plan Compare, Delta Dental, VSP, ASH, Silver&Fit, MedImpact pricing, other external pages. Hand-offs carry `retrieved_by_tool: false` and `evidence: false`. |
+| `unavailable` | `#` placeholders, sample PDFs, generic links. Not evidence. |
+
+### Year, plan and segment rules (1.1.0)
+- Plan documents are evidence only for the **exact coverage year and contract-plan-segment** proven by the PDF text. A 2027 document is never returned for a 2026 request.
+- If a plan has several segments, the segment must be given. A PDF covering several segments is not auto-verified; its columns need manual review.
+- If the title area names more than one coverage year, the document is `unverified` (ambiguous).
+- ZIPs that span counties inside and outside a service area return `unknown_zip_spans_covered_and_uncovered_counties`. `cms_find_plans` asks for the county.
+- Provider plan, specialty and accepting-new-patients filters apply to the **same** plan entry. Records with unknown plan membership are excluded (and counted) when a plan or accepting filter is used.
+- PDP criteria use Part A **or** Part B; MA/SNP criteria need Part A **and** Part B.
 
 ### Known problems on the live MedCare site (snapshot of 2026-10-21; run `medcare_site_audit` for current data)
 - **Identity mismatch.** The "MedCare Choice — Summary of Benefits — Español" link (`H5767_SB0032027SP_M.pdf`) contains the **MedCare Classic (H5767-001)** document.
@@ -37,6 +57,9 @@ Every result includes provenance: source URL, retrieval or snapshot time, file v
 - The site publishes several different phone numbers. `medcare_contacts` shows where each one appears.
 
 ## Install (teammates)
+
+### Platform support
+**macOS and Linux only.** The Codex MCP launcher (`bin/medcare-mcp`) is a POSIX shell script. **Windows is not supported** in this release: `install.py` refuses to run on Windows, and the plugin has not been tested there.
 
 Requirements: the Codex desktop app or the Codex CLI, plus **Python 3.9 or newer** (python.org, `brew install python`, or the Xcode Command Line Tools). If you don't have Python but do have [uv](https://docs.astral.sh/uv/), the launcher uses uv instead. There are no pip installs.
 
@@ -56,9 +79,12 @@ To update later: `codex plugin marketplace upgrade medcare-team-tools`, then rei
 
 Optional: `python3 install.py --prefetch` downloads the CMS 2027 data (about 25 MB) ahead of time so the first query is fast. To remove the plugin: `python3 install.py --uninstall`, or `codex plugin remove medcare-resources@<marketplace>`.
 
-**Windows:** the launcher is a POSIX shell script. Point the server command at `py -3 server.py` (cwd = plugin folder) in `.mcp.json`.
+Re-running `python3 install.py --replace` is transactional. The new copy is checked first. If registering it fails, both the old plugin folder and the original `marketplace.json` are restored. One backup is kept at `~/.codex/plugins/medcare-resources.previous`.
+
+**Pin a release:** to pin the version teammates install, use `codex plugin marketplace add myacaexpress/MCP-Codex-Plugin --ref v1.1.0`.
 
 ### First-use notes
+- CMS caches are re-checked against CMS automatically when older than 7 days (set `MEDCARE_CMS_MAX_AGE_DAYS`) or on demand with `cms_refresh_data`. They are re-downloaded only when CMS publishes a new or revised file. If CMS can't be reached, the cached copy is used and `freshness.last_refresh_error` says so.
 - CMS data is downloaded on first use and cached in `~/.cache/medcare-resources` (Landscape about 13 MB, Part D members about 8 MB, Census about 7 MB). Set `MEDCARE_CACHE_DIR` to change the location.
 - The tools are read-only, apart from writing to that cache.
 
@@ -79,9 +105,11 @@ Optional: `python3 install.py --prefetch` downloads the CMS 2027 data (about 25 
 ## Maintainers
 ```bash
 python3 scripts/build_data.py     # re-crawl site, re-index PDFs, CMS cross-check, NUCC table
-python3 -m pytest -q tests        # offline tests (+ live tests with MEDCARE_LIVE_TESTS=1)
+pip install -r tests/requirements-test.txt   # pytest<9, mcp>=1.20,<2 (test-only; the plugin itself has no deps)
+python3 -m pytest -q tests                   # offline + regression tests
+MEDCARE_LIVE_TESTS=1 python3 -m pytest -q tests/test_live.py   # live public sources, synthetic queries
 python3 package.py                # dist/medcare-resources-<version>.zip
 ```
 Repository layout: `plugins/medcare-resources/` is the plugin (`.codex-plugin/plugin.json`, `.mcp.json`, `bin/medcare-mcp`, `server.py`, `medcare/`, `vendor/`, `data/`, `skills/`), and `.agents/plugins/marketplace.json` is the Git marketplace.
 
-Tested with Codex CLI/app-server 0.163.0 (marketplace add, plugin add, skill loading, MCP server start, `mcpServerStatus/list`, `mcpServer/tool/call`), Python 3.9 to 3.13, and the MCP Python SDK client. A root-level portable `plugin.json` is deliberately left out: with one present, Codex 0.163 ignored the plugin's MCP servers.
+Tested on Linux with Codex CLI/app-server 0.163.0 (marketplace add, plugin add, skill loading, MCP server start, `mcpServerStatus/list`, `mcpServer/tool/call`), Python 3.9 to 3.13, and the MCP Python SDK client. A root-level portable `plugin.json` is deliberately left out: with one present, Codex 0.163 ignored the plugin's MCP servers.

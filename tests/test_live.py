@@ -12,6 +12,18 @@ from conftest import PLUGIN, ROOT
 
 pytestmark = pytest.mark.skipif(os.environ.get("MEDCARE_LIVE_TESTS") != "1", reason="set MEDCARE_LIVE_TESTS=1")
 
+
+def _sdk_ok():
+    try:
+        from importlib.metadata import version
+        return int(version("mcp").split(".")[0]) < 2
+    except Exception:
+        return False
+
+
+if os.environ.get("MEDCARE_LIVE_TESTS") == "1" and not _sdk_ok():
+    raise RuntimeError("Live tests need the pinned MCP SDK v1: pip install -r tests/requirements-test.txt")
+
 CALLS = [
     ("source_status", {"check_cms": True}, lambda r: r["cms_landscape_2027"]["data_last_updated"]),
     ("medcare_site_audit", {}, lambda r: r["summary"]["identity_mismatches"] >= 1),
@@ -46,11 +58,25 @@ CALLS = [
     ("plan_document_retrieve", {"url": "https://mcpartnerstx.com/wp-content/uploads/2026/10/H5767_SB0032027SP_M.pdf",
                                 "plan_id": "H5767-003", "year": 2027}, lambda r: r["status"] == "unverified_document"),
     ("plan_document_search", {"plan_id": "H7993-030", "year": 2027, "query": "dental"}, lambda r: r["results"]),
+    ("plan_document_search", {"plan_id": "H7993-030", "year": 2026, "query": "dental"},
+     lambda r: r["status"] == "no_verified_document"),
+    ("plan_document_search", {"plan_id": "H5767-001", "year": 2026, "query": "monthly premium"},
+     lambda r: r["status"] == "no_verified_document"),
+    ("plan_document_search", {"plan_id": "H5767-001", "year": 2027, "query": "monthly premium"},
+     lambda r: r["results"] and all(d["status"] == "verified_document" for d in r["documents_searched"])),
+    ("cms_find_plans", {"year": 2027, "zip_code": "77477"}, lambda r: r.get("status") == "county_required"
+     or r.get("count", 0) > 0),
+    ("medcare_provider_search", {"provider_type": "specialist", "plan_id": "H5767-001", "accepting_only": True, "limit": 5},
+     lambda r: all(all(e["plan_id"].startswith("H5767-001") and e["accepting_new_patients"].lower().startswith("accepting")
+                       for e in p["plans"]) for p in r["results"])),
+    ("cms_refresh_data", {"year": 2027, "dataset": "landscape"}, lambda r: r["landscape"]["after"]["last_checked_at"]),
     ("compare_plans", {"plan_ids": ["H5767-002", "H7993-030"], "year": 2027, "topics": ["primary care", "dental"],
                        "drugs": ["Eliquis"]}, lambda r: len(r["plans"]) == 2),
     ("plan_eligibility_criteria", {"plan_id": "H5767-002", "year": 2027, "zip_code": "77072", "has_part_a": True,
                                    "has_part_b": True, "qualifying_conditions": ["diabetes"]},
      lambda r: r["personal_eligibility_verified"] is False and r["criteria"][1]["assessment"] == "appears_met"),
+    ("plan_eligibility_criteria", {"plan_id": "H5767-002", "year": 2027, "county": "Fort Bend", "state": "TX"},
+     lambda r: r["criteria"][1]["assessment"] == "appears_not_met"),
 ]
 
 
@@ -88,5 +114,5 @@ def test_live_all_tools():
     report = asyncio.run(_run())
     (ROOT / "tests" / "live-report.json").write_text(json.dumps(report, indent=1))
     failed = [r for r in report[1:] if not r["ok"]]
-    assert report[0]["tools"] >= 26
+    assert report[0]["tools"] >= 27
     assert not failed, json.dumps(failed, indent=1)
