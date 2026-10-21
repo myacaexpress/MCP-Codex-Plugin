@@ -4,3 +4,4 @@ __pycache__/
 .test-cache/
 dist/
 .DS_Store
+tests/live-report.json

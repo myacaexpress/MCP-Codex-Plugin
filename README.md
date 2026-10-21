@@ -65,7 +65,7 @@ Requirements: the Codex desktop app or the Codex CLI, plus **Python 3.9 or newer
 
 ### Option A — from GitHub (recommended; easy to update)
 ```bash
-codex plugin marketplace add myacaexpress/MCP-Codex-Plugin
+codex plugin marketplace add myacaexpress/MCP-Codex-Plugin            # or add: --ref <reviewed commit sha>
 codex plugin add medcare-resources@medcare-team-tools
 ```
 To install from the desktop app instead, run the first command, restart the app, open **Plugins**, choose the **MedCare team tools** source and install **MedCare Resources**. Then open a **new** chat and ask: *"Use MedCare Resources source_status."*
@@ -81,7 +81,7 @@ Optional: `python3 install.py --prefetch` downloads the CMS 2027 data (about 25 
 
 Re-running `python3 install.py --replace` is transactional. The new copy is checked first. If registering it fails, both the old plugin folder and the original `marketplace.json` are restored. One backup is kept at `~/.codex/plugins/medcare-resources.previous`.
 
-**Pin a release:** to pin the version teammates install, use `codex plugin marketplace add myacaexpress/MCP-Codex-Plugin --ref v1.1.0`.
+**Pin a release:** `main` moves. To pin the reviewed commit, pass its SHA, which is listed in the release's FIX_REPORT.md: `codex plugin marketplace add myacaexpress/MCP-Codex-Plugin --ref <commit-sha>`. This was verified with Codex 0.163.
 
 ### First-use notes
 - CMS caches are re-checked against CMS automatically when older than 7 days (set `MEDCARE_CMS_MAX_AGE_DAYS`) or on demand with `cms_refresh_data`. They are re-downloaded only when CMS publishes a new or revised file. If CMS can't be reached, the cached copy is used and `freshness.last_refresh_error` says so.
