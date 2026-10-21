@@ -73,8 +73,11 @@ def test_f3_conflicting_title_years_are_unverified(monkeypatch):
 
 
 def test_f3_effective_dates_only_conflicting_is_ambiguous():
-    yr = research.resolve_year(["Plan H1234-001 benefits January 1, 2026 ... January 1, 2027"])
+    yr = research.resolve_year(["Plan H1234-001 benefits January 1 - December 31, 2026 ... "
+                                "January 1, 2027 through December 31, 2027"])
     assert yr["status"] == "ambiguous_conflicting_years" and yr["year"] is None
+    # bare date mentions are not coverage periods: nothing resolved -> cannot verify
+    assert research.resolve_year(["Plan H1234-001 benefits January 1, 2026 ... January 1, 2027"])["year"] is None
 
 
 def test_f3_real_medcare_documents_resolve_to_2027():
@@ -304,3 +307,101 @@ def test_browser_handoffs_are_labelled():
 def test_test_sdk_is_pinned():
     req = (ROOT / "tests" / "requirements-test.txt").read_text()
     assert "mcp>=1.20,<2" in req
+
+
+# ================= Retest of 2041bd1 =================
+# R1: title year with no separator / reversed / Spanish / coverage-period conflicts
+@pytest.mark.parametrize("pages", [
+    ["Summary of Benefits 2026 H1234-001-000. See also the 2027 Summary of Benefits"],       # exact reproduction
+    ["2026 Summary of Benefits H1234-001-000\nSummary of Benefits: 2027"],
+    ["Summary of Benefits - 2026 H1234-001-000\n2027 Summary of Benefits"],
+    ["Resumen de Beneficios 2026 H1234-001-000\n2027 Resumen de Beneficios"],
+    ["Evidencia de Cobertura de 2026 H1234-001-000\nEvidence of Coverage for 2027"],
+    ["2027 Summary of Benefits H1234-001-000\nJanuary 1 - December 31, 2026"],
+    ["2027 Summary of Benefits H1234-001-000\ndel 1 de enero de 2026 al 31 de diciembre de 2026"],
+    ["Summary of Benefits H1234-001-000\nJanuary 1, 2026 - December 31, 2026\nJanuary 1 - December 31, 2027"],
+    ["H1234_SB0012026_M\n2027 Summary of Benefits H1234-001-000"],
+])
+def test_r1_conflicting_title_years_rejected(monkeypatch, pages):
+    monkeypatch.setattr(cms, "plan_landscape", fake_landscape({(2027, "H1234-001"): ["H1234-001-000"],
+                                                               (2026, "H1234-001"): ["H1234-001-000"]}))
+    for y in (2026, 2027):
+        v = research._verify_identity(pages, "H1234-001-000", y)
+        assert not v["identity_verified"], (pages, y, v["year_resolution"])
+        assert v["year_resolution"]["status"] == "ambiguous_conflicting_years"
+
+
+@pytest.mark.parametrize("pages", [
+    ["Summary of Benefits 2027 H1234-001-000"],
+    ["Summary of Benefits for 2027 H1234-001-000\nJanuary 1, 2027 - December 31, 2027"],
+    ["Resumen de Beneficios para 2027 H1234-001-000\nBeneficios vigentes del 1 de enero de 2027 al 31 de diciembre de 2027"],
+    ["Evidence of Coverage H1234-001-000\nJanuary 1 - December 31, 2027\nYour plan may change on January 1, 2028."],
+])
+def test_r1_single_year_variants_verify(monkeypatch, pages):
+    monkeypatch.setattr(cms, "plan_landscape", fake_landscape({(2027, "H1234-001"): ["H1234-001-000"]}))
+    kind = "evidence_of_coverage" if "Evidence" in pages[0] else "summary_of_benefits"
+    v = research._verify_identity(pages, "H1234-001-000", 2027, kind)
+    assert v["identity_verified"], v["year_resolution"]
+    assert not research._verify_identity(pages, "H1234-001-000", 2026, kind)["identity_verified"]
+
+
+# R2: eligibility must not use an arbitrary first segment
+def _seg_landscape():
+    base = {"category": "MA-PD", "snp": "No", "snp_type": "Not Applicable", "organization": "Synthetic",
+            "plan_type": "HMO", "csnp_conditions": "Not Applicable", "dsnp_integration": "Not Applicable"}
+    segs = [dict(base, plan_id="H1234-001-001", plan_name="Synthetic 001", service_area={"TX": ["Harris"]}),
+            dict(base, plan_id="H1234-001-002", plan_name="Synthetic 002", service_area={"TX": ["Dallas"]})]
+
+    def _f(year, plan_id):
+        c, p, s = cms.parse_plan_id(plan_id)
+        chosen = [x for x in segs if s is None or x["plan_id"].endswith("-" + s)]
+        return {"found": bool(chosen), "plans": chosen, "segment_requested": s,
+                "segments_in_landscape": [x["plan_id"] for x in segs]}
+    return _f
+
+
+def test_r2_eligibility_segment_resolution(monkeypatch):
+    monkeypatch.setattr(cms, "plan_landscape", _seg_landscape())
+    monkeypatch.setattr(cms, "landscape_source", lambda y: {"data_last_updated": "synthetic"})
+    r = research.plan_eligibility_criteria("H1234-001", 2027)
+    assert r["status"] == "segment_required" and "criteria" not in r
+    r = research.plan_eligibility_criteria("H1234-001", 2027, county="Dallas", state="TX")
+    assert r["plan"]["plan_id"] == "H1234-001-002" and r["segment_resolution"]["method"] == "resolved_by_location"
+    assert r["criteria"][1]["assessment"] == "appears_met"
+    r = research.plan_eligibility_criteria("H1234-001", 2027, county="Harris", state="TX")
+    assert r["plan"]["plan_id"] == "H1234-001-001"
+    r = research.plan_eligibility_criteria("H1234-001", 2027, county="Travis", state="TX")
+    assert r["status"] == "segment_required" and r["segment_resolution"]["reason"] == "no_segment_covers_location"
+    r = research.plan_eligibility_criteria("H1234-001-001", 2027, county="Dallas", state="TX")
+    assert r["segment_resolution"]["method"] == "explicit_segment" and r["criteria"][1]["assessment"] == "appears_not_met"
+    monkeypatch.setattr(cms, "zip_counties", lambda z: {"counties": [{"county": "Harris", "state": "TX"},
+                                                                     {"county": "Dallas", "state": "TX"}]})
+    r = research.plan_eligibility_criteria("H1234-001", 2027, zip_code="75000")
+    assert r["status"] == "segment_required" and r["segment_resolution"]["reason"] == "no_segment_covers_location"
+
+
+def test_r2_compare_requires_segment(monkeypatch):
+    monkeypatch.setattr(cms, "plan_landscape", _seg_landscape())
+    monkeypatch.setattr(cms, "landscape_source", lambda y: {"data_last_updated": "synthetic"})
+    c = research.compare_plans(["H1234-001"], 2027, topics=["dental"])
+    assert c["plans"][0]["cms"]["status"] == "segment_required"
+    c = research.compare_plans(["H1234-001-002"], 2027, topics=["dental"])
+    assert c["plans"][0]["cms"]["plan_id"] == "H1234-001-002"
+
+
+# R3: missing method is Invalid Request unless it is a genuine response
+def test_r3_missing_method_is_invalid_request():
+    msgs = [{"jsonrpc": "2.0", "id": 9},
+            {"jsonrpc": "2.0", "id": 10, "result": {}},
+            {"jsonrpc": "2.0", "id": 11, "error": {"code": 1, "message": "x"}},
+            {"jsonrpc": "2.0", "id": 12, "result": {}, "error": {"code": 1, "message": "x"}},
+            {"jsonrpc": "2.0"},
+            {"jsonrpc": "2.0", "id": 13, "method": "ping"}]
+    proc = _rpc(msgs)
+    out = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
+    by_id = {m.get("id"): m for m in out if m.get("id") is not None}
+    assert by_id[9]["error"]["code"] == -32600
+    assert by_id[12]["error"]["code"] == -32600
+    assert 10 not in by_id and 11 not in by_id           # real responses are accepted silently
+    assert any(m.get("id") is None and m["error"]["code"] == -32600 for m in out)
+    assert by_id[13]["result"] == {}

@@ -5,7 +5,7 @@ Independent team tool. Not affiliated with MedCare Partners, CMS or Medicare.gov
 No credentials, beneficiary records or enrollment systems are accessed.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 import sys as _sys
 from pathlib import Path as _Path

@@ -75,6 +75,11 @@ CALLS = [
     ("plan_eligibility_criteria", {"plan_id": "H5767-002", "year": 2027, "zip_code": "77072", "has_part_a": True,
                                    "has_part_b": True, "qualifying_conditions": ["diabetes"]},
      lambda r: r["personal_eligibility_verified"] is False and r["criteria"][1]["assessment"] == "appears_met"),
+    ("plan_eligibility_criteria", {"plan_id": "H4513-061", "year": 2027}, lambda r: r["status"] == "segment_required"),
+    ("plan_eligibility_criteria", {"plan_id": "H4513-061", "year": 2027, "county": "Dallas", "state": "TX"},
+     lambda r: r["plan"]["plan_id"] == "H4513-061-005" and r["segment_resolution"]["method"] == "resolved_by_location"),
+    ("compare_plans", {"plan_ids": ["H4513-061"], "year": 2027, "topics": ["dental"]},
+     lambda r: r["plans"][0]["cms"]["status"] == "segment_required"),
     ("plan_eligibility_criteria", {"plan_id": "H5767-002", "year": 2027, "county": "Fort Bend", "state": "TX"},
      lambda r: r["criteria"][1]["assessment"] == "appears_not_met"),
 ]

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1 — fixes for the independent retest of 2041bd1
+- **P1 title-year detection.** A title year with no separator ("Summary of Benefits 2026"), reversed order, a colon or dash separator, Spanish titles ("Resumen de Beneficios", "Evidencia de Cobertura de …"), document codes and coverage-period statements are all collected. Any conflict means `ambiguous_conflicting_years`, so the document is not verified. Bare date mentions such as "changes on January 1, 2028" are not treated as coverage periods.
+- **P2 eligibility segment.** `plan_eligibility_criteria` no longer uses an arbitrary first segment. The segment is taken from the request, from a single-segment plan, or from the one segment whose CMS service area covers every supplied county/ZIP county; this choice is disclosed. Otherwise it returns `segment_required`. `compare_plans`, `cms_plan_details` (Medicare.gov link) and the CMS cross-check in `plan_document_retrieve` also no longer use the first segment.
+- **MCP.** A message with no `method` returns -32600 Invalid Request unless it is a genuine response (an `id` plus exactly one of `result`/`error`).
+
 ## 1.1.0 — fixes for the independent review of 1.0.0 (commit bdee23f)
 1. **Wrong benefit year.** Bundled MedCare documents are re-verified for the requested year and exact contract-plan-segment before use. Year is resolved from the title area and document code (e.g. `H5767_SB0012027_M`). Requests for 2026 get `no_verified_document`.
 2. **Wrong competitor segment.** Cached documents match only when their verified `contract-plan-segment` and year equal the request. Plans with several segments need an explicit segment. PDFs listing several segments return `multiple_segments_in_document_column_review_required` (not verified).

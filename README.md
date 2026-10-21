@@ -2,7 +2,7 @@
 
 A standalone Codex plugin for teams who work with **MedCare Partners Health Plan of Texas** (https://mcpartnerstx.com, contract **H5767**) and who research Medicare plans. It bundles an MCP server with 27 tools and two skills.
 
-**Version 1.1.0** fixes all nine release blockers from the independent review of 1.0.0 (see `CHANGELOG.md`).
+**Version 1.1.1** fixes all release blockers from the independent review of 1.0.0 and the retest of 1.1.0 (see `CHANGELOG.md`).
 
 > Independent team tool. It is not affiliated with MedCare Partners, CMS or Medicare.gov. It uses **public information only**: no credentials, no member records, no enrollment or eligibility systems (no MARx), no Wayfinder dependency.
 
@@ -42,7 +42,8 @@ Every catalog resource and hand-off carries an `access_mode`:
 ### Year, plan and segment rules (1.1.0)
 - Plan documents are evidence only for the **exact coverage year and contract-plan-segment** proven by the PDF text. A 2027 document is never returned for a 2026 request.
 - If a plan has several segments, the segment must be given. A PDF covering several segments is not auto-verified; its columns need manual review.
-- If the title area names more than one coverage year, the document is `unverified` (ambiguous).
+- If the title area names more than one coverage year (in any word order, English or Spanish, including document codes and coverage periods), the document is `unverified` (ambiguous).
+- Eligibility criteria and comparisons never use an arbitrary segment. The segment comes from the request, from a single-segment plan, or from the one segment whose service area covers the supplied location (this choice is disclosed). Otherwise the result is `segment_required`.
 - ZIPs that span counties inside and outside a service area return `unknown_zip_spans_covered_and_uncovered_counties`. `cms_find_plans` asks for the county.
 - Provider plan, specialty and accepting-new-patients filters apply to the **same** plan entry. Records with unknown plan membership are excluded (and counted) when a plan or accepting filter is used.
 - PDP criteria use Part A **or** Part B; MA/SNP criteria need Part A **and** Part B.

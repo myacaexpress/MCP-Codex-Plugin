@@ -178,7 +178,12 @@ class Server:
             self._error(None, -32600, "Invalid Request: id must be a string or number.")
             return
         if method is None:
-            return  # a response to something we never send
+            if "id" in msg and ("result" in msg) != ("error" in msg):
+                return  # a genuine JSON-RPC response (we never send requests, so it is ignored)
+            self._error(mid if isinstance(mid, (str, int)) and not isinstance(mid, bool) else None, -32600,
+                        "Invalid Request: missing 'method' (and not a valid response with exactly one of "
+                        "'result' or 'error').")
+            return
         if not isinstance(method, str):
             if "id" in msg:
                 self._error(mid, -32600, "Invalid Request: method must be a string.")
