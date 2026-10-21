@@ -5,3 +5,4 @@ __pycache__/
 dist/
 .DS_Store
 tests/live-report.json
+tests/http-e2e-report.json

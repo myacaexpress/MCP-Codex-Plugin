@@ -52,7 +52,41 @@ class Server:
         return deco
 
     # ------------------------------------------------------------------ io
+    _local = threading.local()
+
+    def _log_exception(self):
+        """Log an unexpected error without argument values (no medication lists or identifiers in logs)."""
+        import os as _os
+        if _os.environ.get("MEDCARE_LOG_TRACEBACKS", "1") == "1":
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+        else:
+            et, ev, _tb = sys.exc_info()
+            print(f"[medcare] internal error: {et.__name__ if et else 'unknown'}", file=sys.stderr)
+
+    def handle_sync(self, msg) -> list:
+        """Process one JSON-RPC message (or batch) synchronously and return the responses.
+
+        Used by the Streamable HTTP transport; shares validation and dispatch with stdio.
+        """
+        self._local.capture = []
+        try:
+            if isinstance(msg, list):
+                if not msg:
+                    self._error(None, -32600, "Invalid Request: empty batch")
+                for m in msg:
+                    self.handle(m)
+            else:
+                self.handle(msg)
+            return list(self._local.capture)
+        finally:
+            self._local.capture = None
+
     def _send(self, msg: dict):
+        cap = getattr(self._local, "capture", None)
+        if cap is not None:
+            cap.append(msg)
+            return
         data = json.dumps(msg, ensure_ascii=False, separators=(",", ":"), default=str)
         with self._write_lock:
             self._out.write(data + "\n")
@@ -122,7 +156,7 @@ class Server:
         try:
             self._call_tool_inner(mid, params)
         except Exception as err:  # last-resort guard: every request gets a response
-            traceback.print_exc(file=sys.stderr)
+            self._log_exception()
             self._error(mid, -32603, f"Internal error: {type(err).__name__}")
 
     def _call_tool_inner(self, mid, params):
@@ -146,7 +180,8 @@ class Server:
             result = tool.func(**args)
             if not isinstance(result, dict):
                 result = {"result": result}
-            text = json.dumps(result, ensure_ascii=False, indent=1, default=str)
+            custom = result.pop("_text", None) if isinstance(result, dict) else None
+            text = custom if isinstance(custom, str) else json.dumps(result, ensure_ascii=False, indent=1, default=str)
             if len(text) > 400_000:
                 text = text[:400_000] + "\n… [truncated; narrow the query or lower 'limit']"
             self._result(mid, {"content": [{"type": "text", "text": text}], "structuredContent": result,
@@ -155,7 +190,7 @@ class Server:
             msg = str(err) or type(err).__name__
             self._result(mid, {"content": [{"type": "text", "text": f"Error: {msg}"}], "isError": True})
         except Exception as err:  # unexpected: report without crashing the server
-            traceback.print_exc(file=sys.stderr)
+            self._log_exception()
             msg = f"{type(err).__name__}: {err}"
             self._result(mid, {"content": [{"type": "text", "text": f"Error: {msg}"}], "isError": True})
 
@@ -163,7 +198,7 @@ class Server:
         try:
             self._handle(msg)
         except Exception as err:  # never let one bad message kill the server
-            traceback.print_exc(file=sys.stderr)
+            self._log_exception()
             mid = msg.get("id") if isinstance(msg, dict) else None
             if isinstance(msg, dict) and "id" in msg:
                 self._error(mid, -32603, f"Internal error: {type(err).__name__}")
@@ -213,7 +248,10 @@ class Server:
         elif method == "tools/call":
             if not is_request:
                 return
-            self._pool.submit(self._call_tool, mid, params)
+            if getattr(self._local, "capture", None) is not None:
+                self._call_tool(mid, params)       # HTTP: synchronous within the request
+            else:
+                self._pool.submit(self._call_tool, mid, params)
         elif method == "resources/list":
             self._result(mid, {"resources": []})
         elif method == "resources/templates/list":

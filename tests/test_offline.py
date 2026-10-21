@@ -185,3 +185,19 @@ def test_installer_isolated_home(tmp_path):
     assert [p["name"] for p in json.loads(m.read_text())["plugins"]] == ["other", "medcare-resources"]
     u = subprocess.run([sys.executable, str(ROOT / "install.py"), "--home", str(home), "--uninstall"], capture_output=True, text=True)
     assert u.returncode == 0 and [p["name"] for p in json.loads(m.read_text())["plugins"]] == ["other"]
+
+
+def test_internal_error_logging_never_recurses(monkeypatch, capsys):
+    """Unexpected tool errors are reported (type only when MEDCARE_LOG_TRACEBACKS=0) without crashing."""
+    s = Server("t", "0")
+
+    @s.tool("boom", "raises", schema({}))
+    def boom():
+        raise RuntimeError("synthetic secret-ish detail")
+    call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "boom", "arguments": {}}}
+    for flag in ("1", "0"):
+        monkeypatch.setenv("MEDCARE_LOG_TRACEBACKS", flag)
+        out = s.handle_sync(call)
+        assert out[0]["result"]["isError"] is True
+    err = capsys.readouterr().err
+    assert "Traceback" in err and "internal error: RuntimeError" in err

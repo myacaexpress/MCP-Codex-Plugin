@@ -25,8 +25,11 @@ identifiers. Use only context the user explicitly supplied.
      confirmed from the PDF text) may be quoted. `unverified_document` = do not use. Broker/aggregator copies are
      not official.
 5. **Benefits**: `plan_document_search(plan_id, year, query)` for each topic; quote lines with page citations.
-6. **Drugs**: `cms_drug_coverage(drug_name, plan_ids, year)` (CMS formulary file via RxNorm) and
-   `cms_tier_cost_sharing(plan_id, year)`. For MedCare also `medcare_drug_lookup` (live plan formulary site).
+6. **Drugs**: for a medication LIST (pasted or several names) call `medication_list_check(text, plan_ids, year)` once
+   with the whole list — it returns one row per entry for every plan (coverage, tier, PA/ST/QL, initial-coverage cost
+   sharing) and flags ambiguous/unknown entries. Never loop over single-drug tools for a list. For one drug in depth:
+   `cms_drug_coverage(drug_name, plan_ids, year)` and `cms_tier_cost_sharing(plan_id, year)`; for MedCare also
+   `medcare_drug_lookup` (live plan formulary site).
 7. **Compare**: `compare_plans(plan_ids, year, topics, drugs)`. Keep unknowns as unknown, flag non-comparable
    fields (different segments, plan types, years), and do not call any plan "best" on incomplete evidence.
 8. **Criteria**: `plan_eligibility_criteria` returns public requirements (Part A/B, service area, SNP conditions,

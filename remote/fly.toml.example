@@ -1,0 +1,40 @@
+# Example Fly.io config (not deployed). Copy to fly.toml at the repo root, set app name/region,
+# then: fly volumes create medcare_cache --size 1 ; fly secrets set MEDCARE_ALLOWED_EMAILS=... ; fly deploy
+app = "medcare-resources-mcp"
+primary_region = "dfw"
+
+[build]
+  dockerfile = "remote/Dockerfile"
+
+[env]
+  MEDCARE_RESOURCE_URL = "https://medcare-resources-mcp.fly.dev/mcp"
+  MEDCARE_OAUTH_ISSUER = "https://your-tenant.us.auth0.com/"
+  MEDCARE_REQUIRED_SCOPES = "medcare:read"
+  MEDCARE_CACHE_DIR = "/data/cache"
+  FORWARDED_ALLOW_IPS = "*"
+
+[[mounts]]
+  source = "medcare_cache"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 8
+    hard_limit = 16
+
+[[http_service.checks]]
+  method = "GET"
+  path = "/healthz"
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "20s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"

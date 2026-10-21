@@ -1,3 +1,6 @@
-# Test-only dependencies (the plugin itself needs none). Pinned to the MCP SDK v1 API used by tests/test_live.py.
+# Test-only dependencies (the Codex plugin itself needs none). Pinned to the MCP SDK v1 API used by tests/test_live.py.
 pytest>=8,<9
 mcp>=1.20,<2
+# Remote (ChatGPT) transport tests: same pins as remote/requirements.txt, plus the HTTP test client.
+-r ../remote/requirements.txt
+httpx==0.28.1

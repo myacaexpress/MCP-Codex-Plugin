@@ -1,8 +1,8 @@
 # MedCare Resources — Codex plugin
 
-A standalone Codex plugin for teams who work with **MedCare Partners Health Plan of Texas** (https://mcpartnerstx.com, contract **H5767**) and who research Medicare plans. It bundles an MCP server with 27 tools and two skills.
+A standalone Codex plugin for teams who work with **MedCare Partners Health Plan of Texas** (https://mcpartnerstx.com, contract **H5767**) and who research Medicare plans. It bundles an MCP server with 28 tools and two skills. The same server can also be hosted for **ChatGPT** (see [ChatGPT](#chatgpt-remote-server) below).
 
-**Version 1.1.1** fixes all release blockers from the independent review of 1.0.0 and the retest of 1.1.0 (see `CHANGELOG.md`).
+**Version 1.2.0** adds `medication_list_check`, which checks a whole pasted medication list in one call, and a remote Streamable HTTP + OAuth transport for ChatGPT. See `CHANGELOG.md`.
 
 > Independent team tool. It is not affiliated with MedCare Partners, CMS or Medicare.gov. It uses **public information only**: no credentials, no member records, no enrollment or eligibility systems (no MARx), no Wayfinder dependency.
 
@@ -13,6 +13,7 @@ A standalone Codex plugin for teams who work with **MedCare Partners Health Plan
 | Every public resource and link on mcpartnerstx.com, including placeholders and site defects | `medcare_search_resources`, `medcare_list_resources`, `medcare_get_resource`, `medcare_site_audit`, `medcare_contacts` | Snapshot from a crawl of the WordPress REST API and every page (24 pages, 143 resources) |
 | Full-text search of official PDFs (SB, EOC, formulary, PA/ST criteria, directories, forms, notices), with page citations | `medcare_search_documents`, `medcare_read_document_page` | Snapshot of 29 PDFs (1,713 pages) |
 | Checking freshness | `medcare_verify_resource` (SHA-256 compared live), `medcare_refresh_catalog` (full re-crawl into the local cache) | Live |
+| **Whole medication lists** | `medication_list_check`: paste the full list once; every entry comes back in order with the exact product matched, per-plan tier, PA/ST/QL, cost sharing, provenance, summary counts and a full table | **Live** NLM RxNav and the CMS Part D formulary file, plus the MedCare Formulary Navigator |
 | Medications | `medcare_drug_lookup`: tier, PA/ST/QL and restriction flags, quantity-limit amounts from the formulary PDF, tier conflicts, cost sharing per plan by tier | **Live** Formulary Navigator, plus the PDF snapshot and the CMS Part D file |
 | Providers | `medcare_provider_search`: NPI, per-plan participation, accepting-new-patients status, NUCC specialty names, locations | **Live** MedCare provider-search API |
 | Pharmacies | `medcare_pharmacy_search` | Pharmacy Directory PDF, parsed (637 entries) |
@@ -57,6 +58,39 @@ Every catalog resource and hand-off carries an `access_mode`:
 - Every page of the 2027 Provider Directory PDF has an invisible copy of Pharmacy Directory text in its text layer. The tool removes it before indexing.
 - The site publishes several different phone numbers. `medcare_contacts` shows where each one appears.
 
+## Medication list check
+Paste the whole list once:
+
+> Check this whole medication list against MedCare Classic 2027: *(paste list)*
+
+The tool is `medication_list_check`. Its arguments are `text` (pasted list) and/or `medications` (`[{name, strength, form, release, original}]`), plus optional `plan_ids` (default `H5767-001`, `-002`, `-003`; any Part D plan works, up to 6), `year` (default 2027), `start_at`, `include_medcare_site` and `time_budget_seconds`.
+
+- **Formats:** numbered, bulleted and check-box lists, and `;`, `|`, tab or comma separators. Headers, sig text and start dates are kept apart from the drug. Duplicates are flagged. Combination products (`Losartan-HCTZ 50-12.5`, `hydrocodone/acetaminophen 5/325`) stay as one entry.
+- **No silent substitution:** the matched RxNorm product must have the same ingredient set, strengths, form, release type (ER/DR/XL …) and brand or generic.
+  - If several products remain and their coverage differs, the entry is `needs_clarification` and lists the options.
+  - If only the brand or generic counterpart is on the formulary, the tool says so and asks.
+- **Statuses** (one per entry, in input order):
+  - `matched`;
+  - `matched_multiple_equivalent`;
+  - `needs_clarification`;
+  - `unrecognized`;
+  - `lookup_failed` (upstream or timeout: coverage is **unknown**, not "not covered");
+  - `invalid_entry`;
+  - `deferred_batch_limit`.
+- **Per plan:** tier, PA/ST/QL (with amounts), initial-coverage cost sharing with its limitations, the excluded-drug supplement, and the exact plan ID/segment, year, formulary ID and CMS file vintage.
+- **Output:** summary counts, a full Markdown table and sources. Lists over 100 entries return every entry, with the rest marked `deferred_batch_limit` and a `continuation.start_at`.
+- **Privacy:** lines that look like identifiers (DOB, MBI, SSN, member ID, name or address labels) are redacted and never sent upstream. Lists are not stored or logged.
+
+## ChatGPT (remote server)
+`remote/` runs the **same** tools over MCP Streamable HTTP for ChatGPT. Access is limited to individual team accounts through OAuth: a maintained identity provider issues the tokens, the server verifies them and checks a per-person allowlist. Setup, account requirements and teammate steps are in **[CHATGPT_SETUP.md](CHATGPT_SETUP.md)**.
+
+```bash
+pip install -r remote/requirements.txt
+MEDCARE_OAUTH_ISSUER=... MEDCARE_RESOURCE_URL=https://<host>/mcp MEDCARE_ALLOWED_EMAILS=... python -m remote.medcare_http
+docker build -f remote/Dockerfile -t medcare-resources-remote .
+```
+The Codex plugin does not use or need any of this.
+
 ## Install (teammates)
 
 ### Platform support
@@ -74,8 +108,8 @@ To install from the desktop app instead, run the first command, restart the app,
 To update later: `codex plugin marketplace upgrade medcare-team-tools`, then reinstall or restart.
 
 ### Option B — offline ZIP
-1. Unzip `medcare-resources-1.0.0.zip`.
-2. `cd medcare-resources-1.0.0 && python3 install.py`. This copies the plugin to `~/.codex/plugins/medcare-resources`, adds an entry to `~/.agents/plugins/marketplace.json` and checks that the server lists its tools.
+1. Unzip `medcare-resources-<version>.zip`.
+2. `cd medcare-resources-<version> && python3 install.py`. This copies the plugin to `~/.codex/plugins/medcare-resources`, adds an entry to `~/.agents/plugins/marketplace.json` and checks that the server lists its tools.
 3. `codex plugin add medcare-resources@personal-plugins`, or restart the desktop app and install it from the **Personal plugins** source.
 
 Optional: `python3 install.py --prefetch` downloads the CMS 2027 data (about 25 MB) ahead of time so the first query is fast. To remove the plugin: `python3 install.py --uninstall`, or `codex plugin remove medcare-resources@<marketplace>`.
@@ -106,11 +140,12 @@ Re-running `python3 install.py --replace` is transactional. The new copy is chec
 ## Maintainers
 ```bash
 python3 scripts/build_data.py     # re-crawl site, re-index PDFs, CMS cross-check, NUCC table
-pip install -r tests/requirements-test.txt   # pytest<9, mcp>=1.20,<2 (test-only; the plugin itself has no deps)
-python3 -m pytest -q tests                   # offline + regression tests
+pip install -r tests/requirements-test.txt   # pytest<9, mcp>=1.20,<2, remote deps (test-only; the Codex plugin has no deps)
+python3 -m pytest -q tests                   # offline, regression, batch and HTTP/OAuth tests
+python3 tests/http_e2e.py                    # remote server as a real process + MCP SDK HTTP client (live lookups)
 MEDCARE_LIVE_TESTS=1 python3 -m pytest -q tests/test_live.py   # live public sources, synthetic queries
 python3 package.py                # dist/medcare-resources-<version>.zip
 ```
-Repository layout: `plugins/medcare-resources/` is the plugin (`.codex-plugin/plugin.json`, `.mcp.json`, `bin/medcare-mcp`, `server.py`, `medcare/`, `vendor/`, `data/`, `skills/`), and `.agents/plugins/marketplace.json` is the Git marketplace.
+Repository layout: `remote/` is the ChatGPT HTTP transport; `plugins/medcare-resources/` is the plugin (`.codex-plugin/plugin.json`, `.mcp.json`, `bin/medcare-mcp`, `server.py`, `medcare/`, `vendor/`, `data/`, `skills/`), and `.agents/plugins/marketplace.json` is the Git marketplace.
 
 Tested on Linux with Codex CLI/app-server 0.163.0 (marketplace add, plugin add, skill loading, MCP server start, `mcpServerStatus/list`, `mcpServer/tool/call`), Python 3.9 to 3.13, and the MCP Python SDK client. A root-level portable `plugin.json` is deliberately left out: with one present, Codex 0.163 ignored the plugin's MCP servers.

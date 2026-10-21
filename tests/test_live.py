@@ -24,7 +24,48 @@ def _sdk_ok():
 if os.environ.get("MEDCARE_LIVE_TESTS") == "1" and not _sdk_ok():
     raise RuntimeError("Live tests need the pinned MCP SDK v1: pip install -r tests/requirements-test.txt")
 
+SYNTHETIC_LIST = """Medications (synthetic test list):
+1. Lisinopril 10 mg tablet daily
+2) Metformin ER 500mg - take 1 tab twice daily
+- Eliquis 5 mg BID
+• atorvastatin 40 mg, furosemide 40 mg
+* Losartan-HCTZ 50-12.5 mg daily
+Levothyroxine 25 mcg tablet; omeprazole 20 mg DR capsule
+Lantus SoloStar 100 units/mL pen
+amlodipine 5 mg tablet | Toprol XL 50 mg
+hydrocodone/acetaminophen 5/325 mg q6h prn
+gabapentin 300 mg capsule
+tamsulosin 0.4 mg capsule
+sertraline 50 mg tablet
+pantoprazole 40 mg DR tablet
+Ozempic 1 mg weekly
+Lisinopril 10 mg tablet daily
+Xyzzaprel 10 mg
+lisinopril 15 mg
+"""
+
+
+def _batch_ok(r):
+    res = r["results"]
+    by = {x["original"]: x for x in res}
+    assert r["entries_total"] == len(res) == 20, r["entries_total"]
+    assert [x["index"] for x in res] == list(range(1, 21))
+    eli = by["- Eliquis 5 mg BID"]
+    assert eli["status"] == "matched" and all(p["coverage"] == "covered" and p["tier"] == 3 for p in eli["plans"]
+                                              if p["requested_plan_id"].startswith("H5767"))
+    assert all(p["year"] == 2027 and p["plan_id"].count("-") == 2 for p in eli["plans"])
+    assert "hydrochlorothiazide 12.5 MG / losartan potassium 50 MG Oral Tablet" in json.dumps(
+        by["* Losartan-HCTZ 50-12.5 mg daily"]["matched_products"])
+    assert by["Xyzzaprel 10 mg"]["status"] == "unrecognized"
+    assert by["lisinopril 15 mg"]["status"] == "needs_clarification"
+    assert by["Lisinopril 10 mg tablet daily"]["duplicate_of"] == 1
+    assert r["sources"]["cms_part_d_file"]["file_date"]
+    return True
+
+
 CALLS = [
+    ("medication_list_check", {"text": SYNTHETIC_LIST, "plan_ids": ["H5767-001", "H5767-002", "H5767-003", "H7993-030"],
+                               "year": 2027}, _batch_ok),
     ("source_status", {"check_cms": True}, lambda r: r["cms_landscape_2027"]["data_last_updated"]),
     ("medcare_site_audit", {}, lambda r: r["summary"]["identity_mismatches"] >= 1),
     ("medcare_search_resources", {"query": "appointment of representative"}, lambda r: r["resources"]),

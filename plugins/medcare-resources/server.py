@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from medcare import __version__, catalog, cms, lookups, net, research  # noqa: E402
+from medcare import __version__, batch, catalog, cms, lookups, net, research  # noqa: E402
 from medcare.mcp_stdio import Server, ToolError, schema  # noqa: E402
 
 INSTRUCTIONS = """MedCare Resources: public information only.
@@ -148,10 +148,50 @@ def medcare_contacts(query: str = ""):
           "other restriction flags per strength/form), the official formulary PDF snapshot (quantity-limit amounts, "
           "page numbers), tier discrepancies between them, and each MedCare plan's published cost sharing by tier "
           "from the CMS CY2027 Part D file.",
-          schema({"drug_name": {**S, "description": "Brand or generic name, e.g. 'Eliquis', 'metformin'."},
+          schema({"drug_name": {**S, "description": "Brand or generic name, e.g. 'Eliquis', 'metformin'. "
+                                                   "For a list of several drugs use medication_list_check."},
                   "include_costs": B}, ["drug_name"]))
 def medcare_drug_lookup(drug_name: str, include_costs: bool = True):
     return _wrap(lookups.drug_lookup, drug_name, include_costs)
+
+
+MED_ITEM = {"type": "object", "properties": {
+    "name": {"type": "string", "description": "Brand or generic name as written, e.g. 'Eliquis', 'losartan-HCTZ'."},
+    "strength": {"type": "string", "description": "e.g. '5 mg', '50-12.5 mg', '100 units/mL'."},
+    "form": {"type": "string", "description": "e.g. tablet, capsule, pen, solution, inhaler, patch."},
+    "release": {"type": "string", "description": "e.g. ER, XL, DR, IR."},
+    "original": {"type": "string", "description": "Original text to echo back (optional)."}},
+    "required": ["name"]}
+
+
+@mcp.tool("medication_list_check",
+          "Check a WHOLE medication list in one call. Paste the list as text (bullets, numbers, commas, semicolons, "
+          "pipes and one-per-line are all handled) and/or pass structured items. Returns one result per entry in "
+          "input order with the original text, the exact RxNorm product matched (strength, form, release, brand vs "
+          "generic - never substituted), per-plan coverage/tier/PA/ST/QL from the CMS Part D formulary file, "
+          "initial-coverage cost sharing, MedCare live formulary-site corroboration, summary counts and a full "
+          "markdown table. Ambiguous or unknown entries are marked needs_clarification/unrecognized; upstream failures "
+          "are lookup_failed (unknown, not 'not covered'). Default plans: the three MedCare 2027 plans. Limit "
+          f"{batch.MAX_ENTRIES} entries per call; longer lists return every entry with a continuation start_at. "
+          "Use this instead of calling single-drug tools repeatedly. Do not include patient names/DOB/IDs.",
+          schema({"text": {"type": "string", "maxLength": batch.MAX_TEXT_CHARS,
+                           "description": "Pasted medication list (any common list format)."},
+                  "medications": {"type": "array", "items": MED_ITEM, "maxItems": 500},
+                  "plan_ids": {"type": "array", "items": S, "maxItems": 6,
+                               "description": "Default H5767-001, H5767-002, H5767-003 (MedCare). Any Part D plan works."},
+                  "year": YEAR,
+                  "start_at": {**I, "minimum": 1, "description": "1-based entry to start from (continuation)."},
+                  "include_medcare_site": {**B, "description": "Corroborate MedCare plans against the live formulary site (default true)."},
+                  "time_budget_seconds": {**I, "minimum": 20, "maximum": 280}}))
+def medication_list_check(text: str = "", medications: list | None = None, plan_ids: list | None = None,
+                          year: int = 2027, start_at: int = 1, include_medcare_site: bool = True,
+                          time_budget_seconds: int = 200):
+    if not text and not medications:
+        raise ToolError("Provide 'text' (a pasted list) and/or 'medications'.")
+    result = _wrap(batch.check_list, text, medications, plan_ids, year, start_at, include_medcare_site,
+                   time_budget_seconds)
+    result["_text"] = batch.render_text(result)
+    return result
 
 
 @mcp.tool("medcare_provider_search",

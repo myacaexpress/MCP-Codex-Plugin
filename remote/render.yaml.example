@@ -1,0 +1,23 @@
+# Example Render blueprint (not deployed). Secrets (allowlist) are set in the dashboard (sync: false).
+services:
+  - type: web
+    name: medcare-resources-mcp
+    runtime: docker
+    dockerfilePath: remote/Dockerfile
+    plan: starter
+    healthCheckPath: /healthz
+    disk:
+      name: medcare-cache
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: MEDCARE_RESOURCE_URL
+        value: https://medcare-resources-mcp.onrender.com/mcp
+      - key: MEDCARE_OAUTH_ISSUER
+        value: https://your-tenant.us.auth0.com/
+      - key: MEDCARE_REQUIRED_SCOPES
+        value: medcare:read
+      - key: MEDCARE_ALLOWED_EMAILS
+        sync: false
+      - key: FORWARDED_ALLOW_IPS
+        value: "*"

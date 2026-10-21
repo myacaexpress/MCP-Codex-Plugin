@@ -1,6 +1,6 @@
 {
   "name": "medcare-resources",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Public MedCare Partners Health Plan of Texas resources plus CMS/Medicare plan research with source provenance.",
   "author": {
     "name": "Independent team tool",
@@ -30,7 +30,7 @@
     ],
     "websiteURL": "https://github.com/myacaexpress/MCP-Codex-Plugin",
     "defaultPrompt": [
-      "Is Eliquis covered on MedCare Classic and what tier is it?",
+      "Check this whole medication list against MedCare Classic 2027: <paste list>",
       "Find MedCare in-network cardiologists near ZIP 77072.",
       "Compare MedCare Focus with other C-SNPs in Harris County for 2027."
     ],
