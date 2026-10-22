@@ -48,10 +48,10 @@ def make_puf_zip(path: Path, n_formulary: int = 40000, tier: str = "1") -> None:
     path.write_bytes(b.getvalue())
 
 
-def make_landscape_zip(path: Path) -> None:
+def make_landscape_zip(path: Path, n: int = 30000) -> None:
     header = ["Contract ID", "Plan ID", "Segment ID", "County Name", "State Territory Abbreviation", "Plan Name",
               "Plan Type", "Contract Year"]
-    rows = [["H1111", "001", "0", f"County{i}", "TX", "Synthetic", "HMO", "2027"] for i in range(30000)]
+    rows = [["H1111", "001", "0", f"County{i}", "TX", "Synthetic", "HMO", "2027"] for i in range(n)]
     csv_text = ",".join(header) + "\n" + "\n".join(",".join(r) for r in rows) + "\n"
     b = io.BytesIO()
     with zipfile.ZipFile(b, "w") as z:
@@ -60,10 +60,11 @@ def make_landscape_zip(path: Path) -> None:
     path.write_bytes(b.getvalue())
 
 
-def _install_fakes(cms, net, data_dir: Path, delay: float, fail: bool, stamp: str):
+def _install_fakes(cms, net, data_dir: Path, delay: float, fail: bool, stamp: str, land_stamp: str = "202610"):
     log = data_dir / "builds.log"
     puf = (data_dir / f"puf_{stamp}.zip").read_bytes()
-    land = (data_dir / "landscape.zip").read_bytes()
+    lz = data_dir / f"landscape_{land_stamp}.zip"
+    land = (lz if lz.exists() else data_dir / "landscape.zip").read_bytes()
     zcta = "GEOID_ZCTA5_20|GEOID_COUNTY_20|NAMELSAD_COUNTY_20|AREALAND_PART\n" + "\n".join(
         f"{77000 + i:05d}|48201|Harris County|{1000 + i}" for i in range(20000)) + "\n"
 
@@ -82,7 +83,7 @@ def _install_fakes(cms, net, data_dir: Path, delay: float, fail: bool, stamp: st
             f.write(f"{kind} {os.getpid()}\n")
 
     cms._discover_puf = lambda year: ("https://data.cms.gov/fake.zip", stamp)
-    cms._discover_landscape = lambda year: "https://www.cms.gov/files/zip/cy2027-landscape-202610.zip"
+    cms._discover_landscape = lambda year: f"https://www.cms.gov/files/zip/cy2027-landscape-{land_stamp}.zip"
     cms._RemoteZip = lambda url: (record("puf"), SlowZip(puf))[1]
 
     def fetch(url, **kw):
@@ -102,11 +103,11 @@ def _install_fakes(cms, net, data_dir: Path, delay: float, fail: bool, stamp: st
 
 
 def run(task: str, cache_dir: str, data_dir: str, barrier, results, delay: float = 0.002, fail: bool = False,
-        stamp: str = "20261008", refresh: bool = False, repeat: int = 1):
+        stamp: str = "20261008", refresh: bool = False, repeat: int = 1, land_stamp: str = "202610"):
     os.environ["MEDCARE_CACHE_DIR"] = cache_dir
     os.environ["MEDCARE_CACHE_LOCK_TIMEOUT"] = "120"
     from medcare import cms, net
-    _install_fakes(cms, net, Path(data_dir), delay, fail, stamp)
+    _install_fakes(cms, net, Path(data_dir), delay, fail, stamp, land_stamp)
     out = {"pid": os.getpid(), "task": task}
     try:
         barrier.wait(30)
@@ -123,6 +124,65 @@ def run(task: str, cache_dir: str, data_dir: str, barrier, results, delay: float
                 out["rows"] = len(r["counties"]) if isinstance(r, dict) and "counties" in r else json.dumps(r)[:80]
         out["ok"] = True
     except Exception as err:  # reported to the parent test, never swallowed
+        out["ok"] = False
+        out["error"] = f"{type(err).__name__}: {err}"
+    results.put(out)
+
+
+def _wait_for(flag: Path, timeout: float = 120) -> None:
+    end = time.monotonic() + timeout
+    while not flag.exists():
+        if time.monotonic() > end:
+            raise TimeoutError(f"no {flag.name} signal")
+        time.sleep(0.01)
+
+
+def paused_read(task: str, cache_dir: str, data_dir: str, sync_dir: str, results, where: str = "before_open"):
+    """Reader that pauses at an exact point while the parent runs a real refresh in another process.
+
+    where='before_open': after the published generation was selected, before it is opened (the 1.2.4 P2
+    window; on 1.2.4 this point is just after _fresh(path) returned True). where='after_open': after the
+    connection is obtained, before any query (the reader must keep reading the generation it opened).
+    """
+    os.environ["MEDCARE_CACHE_DIR"] = cache_dir
+    from medcare import cms, net
+    _install_fakes(cms, net, Path(data_dir), 0.0, False, "20261008")
+    sync = Path(sync_dir)
+    state = {"paused": False}
+
+    def pause():
+        if not state["paused"]:
+            state["paused"] = True
+            (sync / "paused").touch()
+            _wait_for(sync / "go")
+
+    if where == "before_open":
+        if hasattr(cms, "_before_open"):
+            cms._before_open = lambda path: pause()
+        else:                                   # 1.2.4: the window is between _fresh(path) and _connect(path)
+            orig = cms._fresh
+
+            def fresh(path):
+                ok = orig(path)
+                if ok:
+                    pause()
+                return ok
+            cms._fresh = fresh
+    out = {"pid": os.getpid(), "task": task, "where": where}
+    try:
+        conn = cms.puf_db(2027) if task == "puf" else cms.landscape_db(2027)
+        if where == "after_open":
+            pause()
+        meta = cms._meta(conn)
+        if task == "puf":
+            out["file_date"] = meta["file_date"]
+            out["tiers"] = sorted({r[0] for r in conn.execute("select distinct TIER_LEVEL_VALUE from formulary")})
+            out["source_file_date"] = cms.puf_source(2027, conn)["file_date"]
+        else:
+            out["source_url"] = meta["source_url"]
+            out["rows"] = conn.execute("select count(*) from area").fetchone()[0]
+        out["ok"] = True
+    except Exception as err:
         out["ok"] = False
         out["error"] = f"{type(err).__name__}: {err}"
     results.put(out)

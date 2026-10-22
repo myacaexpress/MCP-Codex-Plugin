@@ -121,3 +121,82 @@ def test_cache_errors_keep_every_entry_accounted_as_lookup_failed(monkeypatch):
         assert r["plan_errors"]["H5767-001"].startswith("CMS Part D file unavailable")
         assert [x["status"] for x in r["results"]] == ["lookup_failed", "lookup_failed", "unrecognized"]
         assert all(p["coverage"] == "lookup_failed" for x in r["results"][:2] for p in x["plans"])
+
+
+# ------------------------------------------------------------------ review of 1.2.4 (P2): select -> open window
+def _paused_reader_with_refresh(tmp_path, task, where, refresh_kw):
+    ctx = mp.get_context("spawn")
+    sync = tmp_path / "sync"
+    sync.mkdir()
+    q = ctx.Queue()
+    reader = ctx.Process(target=w.paused_read, args=(task, str(tmp_path / "cache"), str(tmp_path / "data"),
+                                                     str(sync), q), kwargs={"where": where})
+    reader.start()
+    w._wait_for(sync / "paused")                    # reader has selected (or opened) the OLD generation
+    refreshed = _run(tmp_path, [(task, refresh_kw)])  # a REAL refresh in another process: publish NEW, delete OLD
+    assert refreshed[0]["ok"], refreshed
+    (sync / "go").touch()
+    out = q.get(timeout=120)
+    reader.join(60)
+    return out
+
+
+def test_reader_paused_between_selection_and_open_survives_refresh_puf(tmp_path, data):
+    assert _run(tmp_path, [("puf", {})])[0]["file_date"] == "20261008"            # OLD (tier 1) published
+    out = _paused_reader_with_refresh(tmp_path, "puf", "before_open", {"stamp": "20261108", "refresh": True})
+    assert out["ok"], out                                     # 1.2.4: OperationalError unable to open database file
+    assert out["file_date"] == out["source_file_date"] == "20261108"   # retried onto the NEW generation
+    assert out["tiers"] == ["2"]                              # data and provenance come from the same file
+    assert [p.name for p in (tmp_path / "cache" / "cms").glob("partd_puf_2027_*.sqlite")] == \
+        ["partd_puf_2027_20261108.sqlite"]
+
+
+def test_reader_that_already_opened_keeps_its_generation_puf(tmp_path, data):
+    _run(tmp_path, [("puf", {})])
+    out = _paused_reader_with_refresh(tmp_path, "puf", "after_open", {"stamp": "20261108", "refresh": True})
+    assert out["ok"], out
+    assert out["file_date"] == out["source_file_date"] == "20261008" and out["tiers"] == ["1"]   # pinned OLD inode
+
+
+def test_reader_paused_between_selection_and_open_survives_refresh_landscape(tmp_path, data):
+    w.make_landscape_zip(data / "landscape_202611.zip", n=31000)
+    _run(tmp_path, [("landscape", {})])
+    out = _paused_reader_with_refresh(tmp_path, "landscape", "before_open", {"land_stamp": "202611", "refresh": True})
+    assert out["ok"], out
+    assert "202611" in out["source_url"] and out["rows"] == 31000
+
+
+def test_open_published_retry_is_bounded(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEDCARE_CACHE_DIR", str(tmp_path))
+    from medcare import cms
+    d = cms._cms_dir()
+    (d / "partd_puf_2027_20261008.sqlite").write_bytes(b"not a database")       # never opens
+    calls = []
+    monkeypatch.setattr(cms, "_before_open", lambda p: calls.append(p))
+    with pytest.raises(cms.CMSDataError, match="changed repeatedly"):
+        cms._open_published("partd_puf_2027_*.sqlite", attempts=3)
+    assert len(calls) == 3
+
+
+def test_sidecar_stamp_is_bound_to_its_generation(monkeypatch, tmp_path):
+    import sqlite3
+    monkeypatch.setenv("MEDCARE_CACHE_DIR", str(tmp_path))
+    from medcare import cms, fslock
+    path = cms._cms_dir() / "partd_puf_2027_20261008.sqlite"
+    for gen in ("2026-10-01T00:00:00+00:00", "2026-10-02T00:00:00+00:00"):
+        tmp = fslock.temp_path(path)
+        c = sqlite3.connect(tmp)
+        c.execute("create table meta(key text primary key, value text)")
+        c.executemany("insert into meta values (?,?)", [("file_date", "20261008"), ("retrieved_at", gen)])
+        c.commit(); c.close()
+        if gen.startswith("2026-10-01"):
+            os_replace = __import__("os").replace
+            os_replace(tmp, path)
+            old_conn = cms._connect(path)                       # reader pinned to generation 1
+            cms._set_meta(path, last_checked_at="2026-10-01T12:00:00+00:00")
+            assert cms._meta(old_conn)["last_checked_at"] == "2026-10-01T12:00:00+00:00"
+        else:
+            __import__("os").replace(tmp, path)                 # same-name rebuild (generation 2)
+            cms._set_meta(path, last_checked_at="2026-10-02T12:00:00+00:00")
+    assert cms._meta(old_conn).get("last_checked_at") != "2026-10-02T12:00:00+00:00"   # not borrowed from gen 2
+    assert cms._meta(cms._connect(path))["last_checked_at"] == "2026-10-02T12:00:00+00:00"

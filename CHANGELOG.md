@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.5 — readers survive a concurrent refresh (P2 from the review of 1.2.4)
+- **The race.** A reader that picked the newest published Part D or Landscape file outside the lock could find it deleted before opening it. Another process could finish a refresh in that window. The reader then failed with `unable to open database file`. `medication_list_check` reported this correctly as `lookup_failed`; it is now retried instead.
+- **Selection and opening are one step.** The new `_open_published` selects the newest generation, opens it, and only then checks freshness on the open connection. If the file vanished or was replaced in between, it re-selects and retries, up to 8 times with backoff, then raises an explicit `CMSDataError`. The reader therefore lands on the newly published generation, and that generation's own metadata is the reported provenance.
+- **Generations are pinned.** `_connect` reads from the file immediately, so a connection keeps reading the generation it opened even if the path is replaced or deleted later.
+- **Freshness stamps are bound to their generation.** Sidecar stamps carry the build identity of the file they describe. A reader holding an older generation never borrows a newer file's `last_checked_at` after a same-name rebuild.
+- **Lock-timeout fallback.** The fallback path (use the existing cache when another build holds the lock too long) uses the same retrying open.
+- **Equivalent caches checked:**
+  - Landscape: fixed in the same way.
+  - Census ZIP→county: built once and never deleted or replaced, so no window.
+  - Site catalog and carrier documents: replaced atomically and never deleted; readers accept only a matching catalog pair.
+- **New deterministic multiprocess regressions:**
+  - a reader paused exactly between selection and opening while a real refresh in another process publishes a new Part D file or Landscape generation and deletes the old one;
+  - a reader paused after opening (it keeps its generation's data and provenance);
+  - the bounded retry;
+  - generation-bound sidecar stamps.
+
+  The paused-reader tests fail on 1.2.4 with `unable to open database file`.
+
 ## 1.2.4 — cross-process safe caches (review of 1.2.3)
 - **Problem fixed.** Separate MCP server processes sharing the per-user cache could corrupt each other's first build or refresh: several Codex chats, a test run, or the remote server's workers. Errors included `table formulary already exists`, `disk I/O error` and `attempt to write a readonly database`. The cause was a process-local lock, one shared `*.tmp` name per dataset, and in-place writes to published files.
 - **New `medcare/fslock.py`:**

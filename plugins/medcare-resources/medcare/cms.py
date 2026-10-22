@@ -151,19 +151,76 @@ def _connect(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(uri, uri=True, check_same_thread=False, factory=_CacheConn)
     conn.row_factory = sqlite3.Row
     conn.cache_path = Path(path)
+    try:
+        # Pin this generation: once the file is open the connection keeps reading the same inode even if a
+        # concurrent refresh replaces or deletes the path afterwards.
+        conn.execute("select 1 from meta limit 1").fetchall()
+    except sqlite3.Error:
+        conn.close()
+        raise
     return conn
+
+
+def _generation(m: dict) -> str:
+    """Identity of one published cache file (its own build stamp), used to bind sidecar stamps to it."""
+    return f"{m.get('file_date') or m.get('file') or ''}|{m.get('retrieved_at') or ''}"
 
 
 def _meta(conn) -> dict:
     m = dict(conn.execute("select key, value from meta").fetchall())
     path = getattr(conn, "cache_path", None)
     if path is not None:
-        m.update(fslock.read_sidecar(path))  # freshness stamps live beside the immutable file
+        side = fslock.read_sidecar(path)  # freshness stamps live beside the immutable file
+        # Only apply stamps written for THIS generation: after a concurrent same-name rebuild the sidecar may
+        # describe a newer file than the one this connection has open.
+        if side.get("generation") == _generation(m):
+            m.update({k: v for k, v in side.items() if k != "generation"})
     return m
 
 
 def _set_meta(path: Path, **values) -> None:
-    fslock.write_sidecar(path, **values)
+    """Record a freshness stamp for the file currently published at `path` (call while holding its lock)."""
+    conn = _connect(path)
+    try:
+        own = dict(conn.execute("select key, value from meta").fetchall())
+    finally:
+        conn.close()
+    fslock.write_sidecar(path, generation=_generation(own), **values)
+
+
+def _before_open(path: Path) -> None:
+    """Test hook: called after a published generation is selected and before it is opened."""
+
+
+def _open_published(pattern: str, require_fresh: bool = False, attempts: int = 8):
+    """Open the newest published generation WITHOUT holding the dataset lock.
+
+    Another process may publish a newer generation and delete this one between selection and opening.
+    Opening then fails; we re-select and retry (bounded, with backoff) so the reader lands on the newly
+    published generation, whose own metadata is then the reported provenance. Returns (conn, path),
+    (None, path) when require_fresh and the newest file is stale, or (None, None) when nothing is published.
+    """
+    import time as _time
+    last = None
+    for attempt in range(attempts):
+        _, cur = _latest(pattern)
+        if cur is None:
+            return None, None
+        _before_open(cur)
+        try:
+            conn = _connect(cur)
+        except (sqlite3.Error, OSError) as err:      # deleted/replaced between selection and opening
+            last = err
+            _time.sleep(min(0.02 * (2 ** attempt), 0.5))
+            continue
+        if require_fresh:
+            age = _age_days(_meta(conn))
+            if age is None or age >= max_age_days():
+                conn.close()
+                return None, cur
+        return conn, cur
+    raise CMSDataError(f"The cached CMS file changed repeatedly while being opened ({type(last).__name__}); "
+                       "try again.")
 
 
 def _new_db(target: Path) -> tuple[sqlite3.Connection, Path]:
@@ -233,16 +290,18 @@ def landscape_db(year: int, refresh: bool = False, force: bool = False) -> sqlit
     Checks, builds and publication are serialised across processes (fslock); readers never wait.
     """
     pattern = f"landscape_v2_{year}_*.sqlite"
-    _, current = _latest(pattern)
-    if current and not refresh and not force and _fresh(current):
-        return _connect(current)
+    if not refresh and not force:
+        conn, _ = _open_published(pattern, require_fresh=True)   # selection and opening are one step
+        if conn is not None:
+            return conn
     try:
         lock = fslock.dataset_lock(_cms_dir(), f"landscape_{year}")
         lock.__enter__()
     except fslock.CacheLockTimeout as err:
-        if current:
+        conn, _ = _open_published(pattern)
+        if conn is not None:
             _REFRESH_ERRORS[("landscape", year)] = f"{net.now_iso()}: {err}"
-            return _connect(current)
+            return conn
         raise CMSDataError(str(err)) from None
     try:
         fslock.remove_orphan_temps(_cms_dir(), f"landscape_v2_{year}_")
@@ -545,16 +604,18 @@ def puf_db(year: int, refresh: bool = False, force: bool = False) -> sqlite3.Con
     """Cached Part D PUF with the same freshness policy as landscape_db (new monthly file -> rebuild).
     Checks, builds and publication are serialised across processes (fslock); readers never wait."""
     pattern = f"partd_puf_{year}_*.sqlite"
-    _, current = _latest(pattern)
-    if current and not refresh and not force and _fresh(current):
-        return _connect(current)
+    if not refresh and not force:
+        conn, _ = _open_published(pattern, require_fresh=True)   # selection and opening are one step
+        if conn is not None:
+            return conn
     try:
         lock = fslock.dataset_lock(_cms_dir(), f"partd_puf_{year}")
         lock.__enter__()
     except fslock.CacheLockTimeout as err:
-        if current:
+        conn, _ = _open_published(pattern)
+        if conn is not None:
             _REFRESH_ERRORS[("part_d", year)] = f"{net.now_iso()}: {err}"
-            return _connect(current)
+            return conn
         raise CMSDataError(str(err)) from None
     try:
         fslock.remove_orphan_temps(_cms_dir(), f"partd_puf_{year}_")
