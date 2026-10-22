@@ -76,12 +76,13 @@ cholecalciferol 1,000 units capsule
 levothyroxine 0,025 mg tablet
 lisinopril 10 mg tablet
 lisinopril (Zestril) 10 mg tablet
+lisinopril (Qwertyzol) 10 mg tablet
 """
 
 
 def _adversarial_ok(r):
     res = r["results"]
-    assert len(res) == 12, [x["original"] for x in res]
+    assert len(res) == 13, [x["original"] for x in res]
     prods = lambda i: [m["product"] for m in res[i].get("matched_products", [])]  # noqa: E731
     assert all("10 MG/" in p for p in prods(0)) and not any(" 1 MG/" in p for p in prods(0))
     assert res[1]["status"] == "needs_clarification" and not prods(1)                 # mg/mL never = UNT/ML
@@ -94,6 +95,8 @@ def _adversarial_ok(r):
     assert [s["value"] for s in res[8]["parsed"]["strengths"]] == [1000.0]
     assert prods(9) == ["levothyroxine sodium 0.025 MG Oral Tablet"]
     assert "duplicate_of" not in res[11] and res[11]["match"]["brand_intent"] and "[Zestril]" in prods(11)[0]
+    assert "Zestril" in res[11]["match"]["rxnav_queries"]
+    assert res[12]["status"] == "needs_clarification" and not prods(12)          # unconfirmed alias: no generic
     return True
 
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.3 — explicit parenthetical brand is never lost (review of 1.2.1)
+- **Batch P1 fix.** Before 1.2.3, a parenthetical name such as `lisinopril (Zestril) 10 mg` was only queried when the first RxNorm response had no results. If that response did not include the brand, the generic was selected silently.
+- The parenthetical name is now captured before any lookup and **always queried**. The result depends on what RxNorm confirms:
+  - It must be confirmed either as a brand of the product, so only that brand's products can match, or as the entry's own ingredient (`Zestril (lisinopril)`).
+  - Otherwise the entry returns `needs_clarification`: `parenthetical_name_not_found_in_rxnorm_results` or `parenthetical_brand_conflicts_with_written_brand`. The generic is never selected.
+  - A failed alias lookup makes the entry `lookup_failed`.
+  - `(generic)` keeps generic intent.
+- Regressions:
+  - the reviewer's reproduction (upstream omits the brand on every query);
+  - the alias query returning nothing;
+  - the alias query failing;
+  - the brand present only via the alias, and present in the first response;
+  - brand first with the generic in parentheses;
+  - `(generic)`;
+  - two conflicting brands;
+  - unknown parenthetical text.
+- Includes the 1.2.2 remote email-binding fix.
+
 ## 1.2.2 — remote OAuth: email verification bound to the exact address (review of 1.2.1)
 - **P1 fix.** An email is now treated as verified only by the verification flag that belongs to that same address:
   - A custom claim (for example `https://medcare-resources/email`) needs its own `…_verified: true`.

@@ -277,3 +277,70 @@ def test_zip_readme_links_resolve_inside_the_zip(tmp_path):
         assert target in names or any(n.startswith(target.rstrip("/") + "/") for n in names), target
     assert "remote/" not in names and "CHATGPT_SETUP.md" not in names
     assert "github.com/myacaexpress/MCP-Codex-Plugin" in readme and "not included in this ZIP" in readme
+
+
+# ------------------------------------------------------------------ review of 1.2.1: explicit parenthetical brand
+GEN = {"rxcui": "1", "name": "lisinopril 10 MG Oral Tablet", "tty": "SCD"}
+ZES = {"rxcui": "3", "name": "lisinopril 10 MG Oral Tablet [Zestril]", "tty": "SBD"}
+PRI = {"rxcui": "5", "name": "lisinopril 10 MG Oral Tablet [Prinivil]", "tty": "SBD"}
+
+
+def _rx(table):
+    calls = []
+
+    def fake(q):
+        calls.append(q)
+        v = table.get(q.lower(), [])
+        if isinstance(v, Exception):
+            raise v
+        return v
+    return fake, calls
+
+
+def test_reviewer_repro_brand_omitted_by_upstream_never_selects_generic(monkeypatch):
+    monkeypatch.setattr(batch, "_rxnav", lambda q: [dict(GEN)])          # every query: generic only
+    res = batch.candidate_products(batch.parse_entry("lisinopril (Zestril) 10 mg tablet"))
+    assert "Zestril" in res["queries"]                                    # the alias is always queried
+    assert res["products"] == [] and res["alias_unresolved"]["reason"] == "parenthetical_name_not_found_in_rxnorm_results"
+
+
+def test_brand_alias_missing_partial_and_present(synthetic, monkeypatch):
+    # (a) alias query returns nothing, generic present -> clarification, generic NOT selected
+    fake, calls = _rx({"lisinopril": [GEN], "zestril": []})
+    monkeypatch.setattr(batch, "_rxnav", fake)
+    it = one("lisinopril (Zestril) 10 mg tablet")
+    assert it["status"] == "needs_clarification" and "matched_products" not in it and "plans" not in it
+    assert it["clarification"]["parenthetical_name"] == "Zestril" and "Zestril" in calls
+    # (b) partial upstream failure on the alias -> lookup_failed (unknown), never the generic
+    fake, calls = _rx({"lisinopril": [GEN], "zestril": batch.net.FetchError("synthetic outage")})
+    monkeypatch.setattr(batch, "_rxnav", fake)
+    it = one("lisinopril (Zestril) 10 mg tablet")
+    assert it["status"] == "lookup_failed" and "matched_products" not in it
+    # (c) brand present only through the alias query -> brand product only
+    fake, calls = _rx({"lisinopril": [GEN], "zestril": [ZES]})
+    monkeypatch.setattr(batch, "_rxnav", fake)
+    it = one("lisinopril (Zestril) 10 mg tablet")
+    assert it["match"]["brand_intent"] is True and rx(it) == ["3"]
+    # (d) brand present in the first response too -> same answer
+    fake, _ = _rx({"lisinopril": [GEN, ZES], "zestril": [ZES]})
+    monkeypatch.setattr(batch, "_rxnav", fake)
+    assert rx(one("lisinopril (Zestril) 10 mg tablet")) == ["3"]
+    # (e) brand written first with the generic in parentheses
+    fake, _ = _rx({"zestril": [ZES], "lisinopril": [GEN, ZES]})
+    monkeypatch.setattr(batch, "_rxnav", fake)
+    assert rx(one("Zestril (lisinopril) 10 mg tablet")) == ["3"]
+    # (f) explicit '(generic)' annotation keeps generic intent
+    fake, _ = _rx({"lisinopril": [GEN, ZES]})
+    monkeypatch.setattr(batch, "_rxnav", fake)
+    assert rx(one("lisinopril (generic) 10 mg tablet")) == ["1"]
+    # (g) two different brands written -> clarification, nothing selected
+    fake, _ = _rx({"zestril": [ZES], "prinivil": [PRI], "lisinopril": [GEN, ZES, PRI]})
+    monkeypatch.setattr(batch, "_rxnav", fake)
+    it = one("Zestril (Prinivil) 10 mg tablet")
+    assert it["status"] == "needs_clarification" and it["clarification"]["reason"] == \
+        "parenthetical_brand_conflicts_with_written_brand" and "matched_products" not in it
+    # (h) unknown parenthetical text -> clarification, never the generic
+    fake, _ = _rx({"lisinopril": [GEN, ZES]})
+    monkeypatch.setattr(batch, "_rxnav", fake)
+    it = one("lisinopril (Qwertyzol) 10 mg tablet")
+    assert it["status"] == "needs_clarification" and "matched_products" not in it

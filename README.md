@@ -2,7 +2,7 @@
 
 A standalone Codex plugin for teams who work with **MedCare Partners Health Plan of Texas** (https://mcpartnerstx.com, contract **H5767**) and who research Medicare plans. It bundles an MCP server with 28 tools and two skills. The same server can also be hosted for **ChatGPT** (see [ChatGPT](#chatgpt-remote-server) below).
 
-**Version 1.2.2** (1.2.0 plus fixes from its independent reviews) has `medication_list_check`, which checks a whole pasted medication list in one call, and a remote Streamable HTTP + OAuth transport for ChatGPT. See `CHANGELOG.md`.
+**Version 1.2.3** (1.2.0 plus fixes from its independent reviews) has `medication_list_check`, which checks a whole pasted medication list in one call, and a remote Streamable HTTP + OAuth transport for ChatGPT. See `CHANGELOG.md`.
 
 > Independent team tool. It is not affiliated with MedCare Partners, CMS or Medicare.gov. It uses **public information only**: no credentials, no member records, no enrollment or eligibility systems (no MARx), no Wayfinder dependency.
 
@@ -72,6 +72,7 @@ The tool is `medication_list_check`. Its arguments are `text` (pasted list) and/
   - Numbers written without a unit (`losartan/HCTZ 50-12.5`) are kept and returned as `needs_clarification`.
   - Explicit delivery forms (vial, pen, cartridge, nebulizer, metered-dose or dry-powder inhaler) are never interchanged.
   - Numeric commas (`1,000 units`, `0,025 mg`) are read as numbers.
+  - A name in parentheses (`lisinopril (Zestril) 10 mg`) is a constraint. It must be confirmed as the brand or the ingredient; otherwise the entry is returned for clarification, never matched to the generic.
   - If several products remain and their coverage differs, the entry is `needs_clarification` and lists the options.
   - If only the brand or generic counterpart is on the formulary, the tool says so and asks.
 - **Statuses** (one per entry, in input order):

@@ -519,22 +519,48 @@ def candidate_products(parsed: dict) -> dict:
         queries.append(ings[0])
     if parsed.get("alias_in_parentheses"):
         queries.append(parsed["alias_in_parentheses"])
+    # A parenthetical name is an explicit constraint ('lisinopril (Zestril) 10 mg' = the Zestril brand). It is
+    # captured before any lookup, always queried, and must be confirmed by RxNorm; otherwise the entry is
+    # returned for clarification. It is never dropped in favour of the generic.
+    alias_raw = (parsed.get("alias_in_parentheses") or "").strip()
+    alias = fold(alias_raw)
+    generic_marker = alias in ("generic", "gen", "generic version", "generic form")
+    explicit_alias = bool(alias) and not generic_marker
     products, used = {}, []
     for q in queries:
-        if not q or len(q) < 2:
+        if not q or len(q) < 2 or (generic_marker and q == alias_raw):
             continue
         res = _rxnav(q)
         used.append(q)
         for p in res:
             products[p["rxcui"]] = p
-        if res and q == parsed["name"] and len(ings) <= 1:
+        if res and q == parsed["name"] and len(ings) <= 1 and not explicit_alias:
             break
     described = {rx: {**p, **describe_product(p)} for rx, p in products.items()}
     typed = fold(parsed["name"])
-    alias = fold(parsed.get("alias_in_parentheses") or "")
     brands = {fold(d["brand"]) for d in described.values() if d["brand"]}
-    brand_intent = typed in brands or (alias and alias in brands)
-    brand_name = typed if typed in brands else alias if alias in brands else None
+    alias_conflict = None
+    if explicit_alias:
+        ref_ings = [fold(i) for i in ings]
+        if typed in brands:
+            ref_ings += [i for d in described.values() if d["brand"] and fold(d["brand"]) == typed
+                         for i in d["ingredients"]]
+        alias_is_ingredient = any(_ing_eq(alias, i) or _ing_eq(i, alias) for i in ref_ings)
+        if alias in brands:
+            if typed in brands and typed != alias:
+                alias_conflict = "parenthetical_brand_conflicts_with_written_brand"
+        elif not alias_is_ingredient:
+            alias_conflict = "parenthetical_name_not_found_in_rxnorm_results"
+    brand_intent = typed in brands or (explicit_alias and alias in brands)
+    brand_name = typed if typed in brands else alias if (explicit_alias and alias in brands) else None
+    if alias_conflict:
+        return {"queries": used, "brand_intent": bool(brand_intent),
+                "brand": brand_name, "products": [], "counterpart_products": [], "recognized": bool(products),
+                "ingredient_matches": 0, "available_after_ingredient": [], "unresolved_options": [],
+                "strength_association": None, "alias_unresolved": {"reason": alias_conflict, "written": alias_raw},
+                "alias_options": sorted({d["name"] for d in described.values()
+                                         if _ingredient_match([fold(i) for i in ings], d["ingredients"])
+                                         and not d["is_pack"]})[:25]}
     pool = []
     for d in described.values():
         if d["is_pack"] and not re.search(r"\b(pack|starter|dose pack)\b", parsed["name"], re.I):
@@ -972,6 +998,15 @@ def _assemble(it, res, site, plan_ctx, plan_errors):
     if not res["recognized"]:
         it.update(status="unrecognized", detail="Not found in RxNorm under this name.",
                   clarification={"reason": "unrecognized_name", "spelling_suggestions": _suggest(p["name"])[:5]})
+        return
+    if res.get("alias_unresolved"):
+        au = res["alias_unresolved"]
+        it.update(status="needs_clarification",
+                  clarification={"reason": au["reason"], "parenthetical_name": au["written"],
+                                 "options_in_rxnorm": res.get("alias_options") or []},
+                  detail=(f"The entry names '{au['written']}' in parentheses, which could not be confirmed as a brand "
+                          "or ingredient of this product in RxNorm. The written name was kept; the generic was NOT "
+                          "selected. Confirm the exact product."))
         return
     if p.get("unresolved_numbers") and res["available_after_ingredient"]:
         opts = sorted({d["name"] for d in res.get("unresolved_options") or [] if not d["is_pack"]})[:25]
