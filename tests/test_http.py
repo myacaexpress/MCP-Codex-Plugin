@@ -281,3 +281,134 @@ def test_remote_default_batch_budget(monkeypatch):
     assert rpc(c, call({"text": "aspirin 81 mg"})).status_code == 200
     assert rpc(c, call({"text": "aspirin 81 mg", "time_budget_seconds": 150})).status_code == 200
     assert seen == [60, 150]
+
+
+# ---------------------------------------------------------------- review of 1.2.0: findings 9-12
+@pytest.mark.parametrize("verified", [None, "false", "False", 0, 1, "true", "True", "yes", [], {}])
+def test_f9_email_verified_must_be_literal_true(verified):
+    r = rpc(client(), INIT, tok=token(email_verified=verified))
+    assert r.status_code == 403, (verified, r.status_code)
+    assert rpc(client(), INIT, tok=token(email_verified=True)).status_code == 200
+
+
+def test_f9_custom_email_claim_needs_its_own_literal_true():
+    ns = "https://medcare-resources/email"
+    ok = token(email=None, email_verified=None, **{ns: "agent1@team.example.com", ns + "_verified": True})
+    assert rpc(client(), INIT, tok=ok).status_code == 200
+    for bad in ("true", 1, None):
+        t = token(email=None, email_verified=None, **{ns: "agent1@team.example.com", ns + "_verified": bad})
+        assert rpc(client(), INIT, tok=t).status_code == 403, bad
+
+
+def test_f10_userinfo_never_sent_to_untrusted_or_plain_http_hosts():
+    called = []
+    spy = lambda url, tok: called.append(url) or {"sub": "auth0|someone", "email": "agent1@team.example.com",  # noqa: E731
+                                                 "email_verified": True}
+    for endpoint in ("https://evil.example.net/userinfo", "http://team-idp.example.com/userinfo",
+                     "https://user:pw@team-idp.example.com/userinfo"):
+        c = cfg()
+        v = Verifier(c, jwk_client=FakeJWKS(), userinfo_fetch=spy)
+        v._meta = {"issuer": ISS, "userinfo_endpoint": endpoint}
+        app = TestClient(create_app(c, v, Settings({})))
+        assert rpc(app, INIT, tok=token(email=None)).status_code == 403, endpoint
+    assert called == [] or all(u.startswith("https://team-idp.example.com/") for u in called)
+    assert not any("evil" in u or u.startswith("http://") for u in called)
+
+
+def test_f10_redirects_are_refused_and_token_never_forwarded(tmp_path, monkeypatch):
+    """Real HTTPS userinfo endpoint answering 302 -> another host over plain HTTP: the token must not follow."""
+    import datetime as dt
+    import ipaddress
+    import ssl
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.x509.oid import NameOID
+    from remote import oauth
+
+    stolen = []
+
+    class Sink(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            stolen.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"sub":"auth0|someone","email":"agent1@team.example.com","email_verified":true}')
+
+        def log_message(self, *a):
+            pass
+    sink = ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+    threading.Thread(target=sink.serve_forever, daemon=True).start()
+
+    hits = []
+
+    class Redirector(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            hits.append(self.headers.get("Authorization"))
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{sink.server_address[1]}/steal")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = dt.datetime.now(dt.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number()).not_valid_before(now - dt.timedelta(minutes=5))
+            .not_valid_after(now + dt.timedelta(hours=1))
+            .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), False)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True).sign(key, hashes.SHA256()))
+    (tmp_path / "c.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    (tmp_path / "k.pem").write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                       serialization.NoEncryption()))
+    red = ThreadingHTTPServer(("127.0.0.1", 0), Redirector)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(tmp_path / "c.pem", tmp_path / "k.pem")
+    red.socket = ctx.wrap_socket(red.socket, server_side=True)
+    threading.Thread(target=red.serve_forever, daemon=True).start()
+    def trusting_context(*a, **k):
+        tctx = ssl.create_default_context(cafile=str(tmp_path / "c.pem"))
+        tctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)   # throwaway self-signed test certificate
+        return tctx
+    monkeypatch.setattr(ssl, "_create_default_https_context", trusting_context)
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("NO_PROXY", "*")
+    url = f"https://127.0.0.1:{red.server_address[1]}/userinfo"
+    import urllib.error
+    with pytest.raises(urllib.error.HTTPError) as exc:   # TLS succeeded; the 302 itself is refused
+        oauth._https_json(url, {"Authorization": "Bearer synthetic-token"}, trusted_hosts={"127.0.0.1"})
+    assert exc.value.code == 302
+    c = cfg(userinfo_url=url)
+    v = Verifier(c, jwk_client=FakeJWKS())          # real fetch path (no spy)
+    v._meta = {"issuer": ISS}
+    assert rpc(TestClient(create_app(c, v, Settings({}))), INIT, tok=token(email=None)).status_code == 403
+    assert stolen == [] and len(hits) == 2   # both requests reached the HTTPS endpoint; none followed the 302
+    red.shutdown()
+    sink.shutdown()
+
+
+def test_f11_userinfo_must_return_the_same_subject():
+    for info in ({"email": "agent1@team.example.com", "email_verified": True},
+                 {"sub": None, "email": "agent1@team.example.com", "email_verified": True},
+                 {"sub": "", "email": "agent1@team.example.com", "email_verified": True},
+                 {"sub": ["auth0|someone"], "email": "agent1@team.example.com", "email_verified": True},
+                 {"sub": "auth0|someone2", "email": "agent1@team.example.com", "email_verified": True}):
+        assert rpc(client(userinfo=lambda u, t, i=info: i), INIT, tok=token(email=None)).status_code == 403, info
+    good = {"sub": "auth0|someone", "email": "agent1@team.example.com", "email_verified": True}
+    assert rpc(client(userinfo=lambda u, t: good), INIT, tok=token(email=None)).status_code == 200
+
+
+def test_f12_logs_never_contain_caller_method_text(caplog):
+    caplog.set_level(logging.INFO)
+    c = client()
+    evil = "x\nFAKE status=200 user=admin Synthetic Example"
+    rpc(c, {"jsonrpc": "2.0", "id": 1, "method": evil})
+    rpc(c, [{"jsonrpc": "2.0", "id": 2, "method": "tools/call\r\nINJECTED", "params": {}},
+            {"jsonrpc": "2.0", "id": 3, "method": 12345}])
+    rpc(c, {"jsonrpc": "2.0", "id": 4, "method": "ping"})
+    logs = "\n".join(r.getMessage() for r in caplog.records if r.name == "medcare.http")
+    assert "FAKE" not in logs and "INJECTED" not in logs and "Synthetic" not in logs and "12345" not in logs
+    assert "method=unknown status=200" in logs and "method=unknown,unknown" in logs and "method=ping" in logs

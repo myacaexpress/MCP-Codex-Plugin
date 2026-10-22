@@ -2,7 +2,7 @@
 
 A standalone Codex plugin for teams who work with **MedCare Partners Health Plan of Texas** (https://mcpartnerstx.com, contract **H5767**) and who research Medicare plans. It bundles an MCP server with 28 tools and two skills. The same server can also be hosted for **ChatGPT** (see [ChatGPT](#chatgpt-remote-server) below).
 
-**Version 1.2.0** adds `medication_list_check`, which checks a whole pasted medication list in one call, and a remote Streamable HTTP + OAuth transport for ChatGPT. See `CHANGELOG.md`.
+**Version 1.2.1** (1.2.0 plus fixes from its independent review) has `medication_list_check`, which checks a whole pasted medication list in one call, and a remote Streamable HTTP + OAuth transport for ChatGPT. See `CHANGELOG.md`.
 
 > Independent team tool. It is not affiliated with MedCare Partners, CMS or Medicare.gov. It uses **public information only**: no credentials, no member records, no enrollment or eligibility systems (no MARx), no Wayfinder dependency.
 
@@ -67,6 +67,11 @@ The tool is `medication_list_check`. Its arguments are `text` (pasted list) and/
 
 - **Formats:** numbered, bulleted and check-box lists, and `;`, `|`, tab or comma separators. Headers, sig text and start dates are kept apart from the drug. Duplicates are flagged. Combination products (`Losartan-HCTZ 50-12.5`, `hydrocodone/acetaminophen 5/325`) stay as one entry.
 - **No silent substitution:** the matched RxNorm product must have the same ingredient set, strengths, form, release type (ER/DR/XL …) and brand or generic.
+  - Strengths match on value **and** unit **and** denominator. `100 mg/mL` never matches `100 UNT/ML`, and `1%` matches `10 MG/G`.
+  - Combination values bind to the ingredients in the order written.
+  - Numbers written without a unit (`losartan/HCTZ 50-12.5`) are kept and returned as `needs_clarification`.
+  - Explicit delivery forms (vial, pen, cartridge, nebulizer, metered-dose or dry-powder inhaler) are never interchanged.
+  - Numeric commas (`1,000 units`, `0,025 mg`) are read as numbers.
   - If several products remain and their coverage differs, the entry is `needs_clarification` and lists the options.
   - If only the brand or generic counterpart is on the formulary, the tool says so and asks.
 - **Statuses** (one per entry, in input order):
@@ -82,11 +87,14 @@ The tool is `medication_list_check`. Its arguments are `text` (pasted list) and/
 - **Privacy:** lines that look like identifiers (DOB, MBI, SSN, member ID, name or address labels) are redacted and never sent upstream. Lists are not stored or logged.
 
 ## ChatGPT (remote server)
-`remote/` runs the **same** tools over MCP Streamable HTTP for ChatGPT. Access is limited to individual team accounts through OAuth: a maintained identity provider issues the tokens, the server verifies them and checks a per-person allowlist. Setup, account requirements and teammate steps are in **[CHATGPT_SETUP.md](CHATGPT_SETUP.md)**.
+The same tools can be hosted for ChatGPT over MCP Streamable HTTP, with OAuth sign-in for individual team accounts and a per-person allowlist. **The remote server is not included in this ZIP**, which contains only the Codex plugin. To set up the ChatGPT version, check out the repository; setup steps, account requirements and teammate instructions are in `CHATGPT_SETUP.md` there:
+
+- Repository: https://github.com/myacaexpress/MCP-Codex-Plugin (`remote/` folder)
+- Setup guide: https://github.com/myacaexpress/MCP-Codex-Plugin/blob/main/CHATGPT_SETUP.md
 
 ```bash
+git clone https://github.com/myacaexpress/MCP-Codex-Plugin.git && cd MCP-Codex-Plugin
 pip install -r remote/requirements.txt
-MEDCARE_OAUTH_ISSUER=... MEDCARE_RESOURCE_URL=https://<host>/mcp MEDCARE_ALLOWED_EMAILS=... python -m remote.medcare_http
 docker build -f remote/Dockerfile -t medcare-resources-remote .
 ```
 The Codex plugin does not use or need any of this.

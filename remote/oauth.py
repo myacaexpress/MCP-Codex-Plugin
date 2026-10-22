@@ -23,6 +23,7 @@ import os
 import threading
 import time
 import urllib.request
+from urllib.parse import urlsplit
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
@@ -56,7 +57,6 @@ class AuthConfig:
     jwks_url: str | None = None
     userinfo_url: str | None = None
     userinfo_fallback: bool = True
-    require_email_verified: bool = True
     leeway: int = 30
     scopes_supported: list[str] = field(default_factory=list)
 
@@ -84,16 +84,37 @@ class AuthConfig:
             jwks_url=env.get("MEDCARE_OAUTH_JWKS_URL") or None,
             userinfo_url=env.get("MEDCARE_OAUTH_USERINFO_URL") or None,
             userinfo_fallback=env.get("MEDCARE_USERINFO_FALLBACK", "1") == "1",
-            require_email_verified=env.get("MEDCARE_REQUIRE_EMAIL_VERIFIED", "1") == "1",
             scopes_supported=_split(env.get("MEDCARE_SCOPES_SUPPORTED")) or ["openid", "email", *scopes],
         )
 
 
-def _https_json(url: str, headers: dict | None = None, timeout: int = 10) -> dict:
-    if not url.startswith("https://"):
-        raise AuthError(401, "invalid_token", "authorization server URL must be https")
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: a bearer token must not be forwarded to any other URL or host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+
+
+def _host(url: str) -> str:
+    return (urlsplit(url).hostname or "").lower()
+
+
+def _trusted_https(url: str, trusted_hosts: set | None) -> bool:
+    parts = urlsplit(url or "")
+    return (parts.scheme == "https" and bool(parts.hostname) and not parts.username and not parts.password
+            and (trusted_hosts is None or parts.hostname.lower() in trusted_hosts))
+
+
+def _https_json(url: str, headers: dict | None = None, timeout: int = 10, trusted_hosts: set | None = None) -> dict:
+    """GET JSON over HTTPS from a trusted host only, with redirects refused (3xx -> error)."""
+    if not _trusted_https(url, trusted_hosts):
+        raise AuthError(401, "invalid_token", "authorization server URL must be plain https on a trusted host")
     req = urllib.request.Request(url, headers={"Accept": "application/json", **(headers or {})})
-    with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 (https enforced above)
+    with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:  # noqa: S310 (https + trusted host enforced above)
+        if r.status != 200:
+            raise AuthError(401, "invalid_token", "unexpected authorization server response")
         return json.loads(r.read(1_000_000))
 
 
@@ -101,8 +122,11 @@ class Verifier:
     def __init__(self, cfg: AuthConfig, jwk_client=None, userinfo_fetch=None):
         self.cfg = cfg
         self._jwk_client = jwk_client
+        # Hosts allowed to receive anything from this server: the issuer's host, plus hosts the operator
+        # configured explicitly. The bearer token is only ever sent to the userinfo URL on one of these.
+        self.trusted_hosts = {_host(cfg.issuer)} | {_host(u) for u in (cfg.userinfo_url, cfg.jwks_url) if u}
         self._userinfo_fetch = userinfo_fetch or (lambda url, token: _https_json(
-            url, {"Authorization": f"Bearer {token}"}))
+            url, {"Authorization": f"Bearer {token}"}, trusted_hosts=self.trusted_hosts))
         self._lock = threading.Lock()
         self._email_cache: "OrderedDict[str, tuple[float, str | None]]" = OrderedDict()
         self._meta: dict | None = None
@@ -114,7 +138,7 @@ class Verifier:
             last = None
             for path in ("/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"):
                 try:
-                    meta = _https_json(base + path)
+                    meta = _https_json(base + path, trusted_hosts=self.trusted_hosts)
                     if meta.get("issuer") == self.cfg.issuer:
                         self._meta = meta
                         break
@@ -127,8 +151,8 @@ class Verifier:
     def jwk_client(self) -> PyJWKClient:
         if self._jwk_client is None:
             url = self.cfg.jwks_url or self._as_metadata().get("jwks_uri")
-            if not url or not url.startswith("https://"):
-                raise AuthError(401, "invalid_token", "issuer has no https jwks_uri")
+            if not url or not _trusted_https(url, self.trusted_hosts):
+                raise AuthError(401, "invalid_token", "issuer has no https jwks_uri on a trusted host")
             self._jwk_client = PyJWKClient(url, cache_keys=True, lifespan=3600, timeout=10)
         return self._jwk_client
 
@@ -171,13 +195,15 @@ class Verifier:
         return {"sub": sub, "email": email, "scopes": sorted(scopes)}
 
     def _email(self, claims: dict, token: str) -> str | None:
+        """The caller's email, only if the IdP asserts it is verified with the literal JSON value true."""
         for name in self.cfg.email_claims:
             value = claims.get(name)
             if isinstance(value, str) and "@" in value:
-                verified = claims.get("email_verified", claims.get(name + "_verified"))
-                if self.cfg.require_email_verified and verified is False:
-                    return None
-                return value.strip().lower()
+                verified = claims.get(name + "_verified") if name != "email" else claims.get("email_verified")
+                if verified is not True and name != "email":
+                    verified = claims.get("email_verified")
+                if verified is True:
+                    return value.strip().lower()
         if not (self.cfg.allowed_emails and self.cfg.userinfo_fallback):
             return None
         key = hashlib.sha256(token.encode()).hexdigest()
@@ -189,13 +215,17 @@ class Verifier:
         url = self.cfg.userinfo_url
         try:
             url = url or self._as_metadata().get("userinfo_endpoint")
+            if url and not _trusted_https(url, self.trusted_hosts):
+                url = None  # never send the token to an untrusted or non-https endpoint
             info = self._userinfo_fetch(url, token) if url else {}
         except Exception:
             info = {}
-        email = info.get("email") if isinstance(info.get("email"), str) else None
-        if email and info.get("sub") not in (None, claims.get("sub")):
-            email = None  # userinfo must describe the same subject
-        if email and self.cfg.require_email_verified and info.get("email_verified") is not True:
+        if not isinstance(info, dict):
+            info = {}
+        email = info.get("email") if isinstance(info.get("email"), str) and "@" in info.get("email") else None
+        if not (isinstance(info.get("sub"), str) and info.get("sub") == claims.get("sub")):
+            email = None  # userinfo must name exactly the same subject as the token
+        if info.get("email_verified") is not True:
             email = None
         email = email.strip().lower() if email else None
         with self._lock:

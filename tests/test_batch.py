@@ -52,6 +52,10 @@ for rx in ("96", "97", "98", "99", "100", "101", "102", "103", "104"):
     FORMULARY[rx] = (1, "N", "N", "N", "", "")
 
 
+class synthetic_db:  # handle for tests that need to edit the synthetic CMS file
+    db = None
+
+
 @pytest.fixture
 def synthetic(monkeypatch):
     calls = []
@@ -71,7 +75,13 @@ def synthetic(monkeypatch):
     db.row_factory = sqlite3.Row
     db.execute("create table formulary(FORMULARY_ID, RXCUI, TIER_LEVEL_VALUE, PRIOR_AUTHORIZATION_YN, "
                "STEP_THERAPY_YN, QUANTITY_LIMIT_YN, QUANTITY_LIMIT_AMOUNT, QUANTITY_LIMIT_DAYS)")
-    db.execute("create table excluded(CONTRACT_ID, PLAN_ID, RXCUI)")
+    db.execute("create table excluded(CONTRACT_ID, PLAN_ID, RXCUI, TIER, QUANTITY_LIMIT_YN, QUANTITY_LIMIT_AMOUNT, "
+               "QUANTITY_LIMIT_DAYS, PRIOR_AUTH_YN, STEP_THERAPY_YN, CAPPED_BENEFIT_YN)")
+    db.execute("create table meta(key text primary key, value text)")
+    db.executemany("insert into meta values (?,?)", [("dataset", "Synthetic Part D file (OLD)"), ("file_date", "OLD"),
+                                                     ("source_url", "https://example.invalid/old.zip"),
+                                                     ("retrieved_at", "2026-10-21T00:00:00+00:00"),
+                                                     ("last_checked_at", "2026-10-21T00:00:00+00:00")])
     for rx, (t, pa, st, ql, amt, days) in FORMULARY.items():
         db.execute("insert into formulary values ('F1',?,?,?,?,?,?,?)", (rx, str(t), pa, st, ql, amt, days))
     tiers = [{"coverage_stage": "initial coverage", "tier": t, "days_supply": d,
@@ -79,18 +89,19 @@ def synthetic(monkeypatch):
               "preferred_retail": None, "deductible_applies": t >= 3, "specialty_tier": False}
              for t in range(1, 7) for d in ("30-day", "90-day")]
 
-    def fake_ctx(year, pid):
+    def fake_ctx(conn, year, pid):
         c, p, s = cms.parse_plan_id(pid)
         if c == "H9999":
             raise ValueError(f"{pid}: not in the CMS Part D file for {year}")
         return {"plan_id": f"{c}-{p}-{s or '000'}", "plan_name": f"Synthetic {p}", "year": year, "formulary_id": "F1",
-                "part_d_deductible": 250.0, "tiers": tiers, "insulin": [], "contract": c, "pbp": p}
+                "part_d_deductible": 250.0, "tiers": tiers, "insulin": [], "contract": c, "pbp": p, "_conn": conn}
 
     monkeypatch.setattr(batch, "_rxnav", fake_rxnav)
     monkeypatch.setattr(batch, "_suggest", lambda n: ["synthetic-suggestion"])
     monkeypatch.setattr(batch, "_plan_context", fake_ctx)
     monkeypatch.setattr(batch.cms, "puf_db", lambda year, *a, **k: db)
     monkeypatch.setattr(batch, "_sources", lambda y, c: {"synthetic": True})
+    synthetic_db.db = db
     return calls
 
 

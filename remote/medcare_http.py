@@ -91,6 +91,17 @@ class RateLimiter:
             return (1 - tokens) / self.rate if self.rate else 60.0
 
 
+# Only these fixed names ever reach the log; any other caller-supplied method text is logged as "unknown".
+_LOGGABLE_METHODS = frozenset({
+    "initialize", "ping", "tools/list", "tools/call", "resources/list", "resources/templates/list", "prompts/list",
+    "notifications/initialized", "notifications/cancelled", "notifications/progress",
+    "notifications/roots/list_changed"})
+
+
+def _log_method(m) -> str:
+    return m if isinstance(m, str) and m in _LOGGABLE_METHODS else "unknown"
+
+
 def _rpc_error(mid, code, message):
     return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
 
@@ -179,7 +190,7 @@ def create_app(cfg: AuthConfig, verifier: Verifier | None = None, settings: Sett
             return JSONResponse(_rpc_error(None, -32700, "Parse error"), 400), 400, who, "-"
         msgs = msg if isinstance(msg, list) else [msg]
         methods = [m.get("method") for m in msgs if isinstance(m, dict)]
-        method = ",".join(str(x) for x in methods[:5]) or "-"
+        method = ",".join(_log_method(x) for x in methods[:5]) or "-"
         wait = limiter.take(user["sub"])
         if wait:
             return (JSONResponse(_rpc_error(None, -32000, "Rate limit exceeded; retry shortly"), 429,

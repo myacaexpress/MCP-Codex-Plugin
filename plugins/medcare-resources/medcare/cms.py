@@ -554,8 +554,9 @@ def _build_puf(year: int, url: str, stamp: str, target: Path) -> None:
         tmp.replace(target)
 
 
-def puf_source(year: int) -> dict:
-    m = _meta(puf_db(year))
+def puf_source(year: int, conn: sqlite3.Connection | None = None) -> dict:
+    """Provenance of the Part D file. Pass `conn` to describe exactly the file a caller is reading."""
+    m = _meta(conn if conn is not None else puf_db(year))
     m["freshness"] = _freshness(m, "part_d", year)
     m["notice"] = ("CMS formulary/cost PUF reflects plan submissions; plans can change formularies during "
                    "the year. Not a personal price quote.")
@@ -610,14 +611,14 @@ def _cost_value(ctype: str, amt: str, mn: str = "", mx: str = ""):
     return out
 
 
-def tier_cost_sharing(year: int, plan_id: str) -> dict:
+def tier_cost_sharing(year: int, plan_id: str, conn: sqlite3.Connection | None = None) -> dict:
     contract, pbp, seg = parse_plan_id(plan_id)
-    conn = puf_db(year)
+    conn = conn if conn is not None else puf_db(year)
     seg = seg or "000"
     rows = [dict(r) for r in conn.execute("select * from cost where CONTRACT_ID=? and PLAN_ID=? and SEGMENT_ID=?",
                                           (contract, pbp, seg))]
     if not rows:
-        return {"found": False, "plan_id": fmt_plan(contract, pbp, seg), "source": puf_source(year)}
+        return {"found": False, "plan_id": fmt_plan(contract, pbp, seg), "source": puf_source(year, conn)}
     table = []
     for r in rows:
         table.append({
@@ -636,7 +637,7 @@ def tier_cost_sharing(year: int, plan_id: str) -> dict:
                         **{k.lower(): (float(v) if v not in ("", None) else None) for k, v in r.items()
                            if k.lower().startswith(("copay_", "coin_")) and v.strip() != ""}})
     return {"found": True, "plan_id": fmt_plan(contract, pbp, seg), "tiers": table,
-            "insulin_cost_sharing": insulin, "source": puf_source(year),
+            "insulin_cost_sharing": insulin, "source": puf_source(year, conn),
             "interpretation": ("Plan-level published cost sharing by tier, coverage stage, days supply and pharmacy type "
                                "(record layout: 0=not offered). Insulin rows override tier cost sharing for covered "
                                "insulin products. Not a personal price quote.")}

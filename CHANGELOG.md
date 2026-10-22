@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.2.1 — fixes for the independent review of 1.2.0 (commit 19843bf)
+**Medication list matching (`medication_list_check`)**
+1. **Units, denominators and association.** A strength now matches only when value, unit and denominator all agree:
+   - mg never equals units; per-mL never equals a bare amount;
+   - `%` converts to 10 mg/g or 10 mg/mL (hydrocortisone 1% matches 10 MG/G, never 1 MG/G);
+   - "400 mg/5 mL" and "21 mg/24 hr" are normalised to per-1 values.
+   - When each ingredient is named, values bind to ingredients in written order: `losartan/HCTZ 12.5/50` no longer matches HCTZ 12.5 / losartan 50.
+   - When a brand is written with unnamed values (`Hyzaar 50-12.5`), matching is by value set and is disclosed (`strength_association: not_stated`).
+2. **Unitless numbers are kept.** `losartan/HCTZ 50-12.5`, `aspirin 81` and `lisinopril10` keep their numbers as a constraint and return `needs_clarification` (`strength_unit_not_stated`), with options limited to products whose numbers fit. They never match any strength. Counts such as "1 tab" or "2 puffs" are still treated as counts.
+3. **Delivery forms are distinct.** These forms each match only their own RxNorm dose forms: vial, pen, cartridge, auto-injector, syringe, nebulizer, metered-dose inhaler, dry-powder inhaler and soft-mist inhaler. Generic words ("injection", "inhalation") stay broad, and any coverage difference is raised as a clarification.
+4. **Numeric commas.** Thousands commas (`1,000 units`) and decimal commas (`0,025 mg`, `2,5 mg`) are protected before list splitting. The original text is echoed unchanged.
+5. **Duplicates.** The duplicate key includes the parenthetical brand, the ingredients and the full strength (value, unit, denominator), plus unresolved numbers, form and release. `lisinopril (Zestril) 10 mg` is no longer a duplicate of `lisinopril 10 mg`.
+6. **Identifiers on every path.**
+   - Structured items are checked field by field (name, strength, form, release, original) with the same identifier rule as pasted text. Matching items are redacted and never sent upstream.
+   - A final guard blocks identifier-like queries before RxNav, spelling suggestions and the MedCare Navigator.
+   - The identifier pattern now also catches `Name:` labels (previously missed), "member", "beneficiary", policy numbers and 9-digit numbers.
+7. **No stale CMS data.** The cross-call plan/cost cache is removed. Each call opens the CMS Part D file once and uses that same file for every plan context, formulary/cost lookup and the reported provenance. Each plan result now carries `cms_file`. The MedCare Navigator cache is per call.
+8. **Supplemental coverage per product.** Formulary terms and supplemental (excluded-drug) terms are kept for each product, including tier, PA, ST, QL and capped benefit. One answer is given only when every matched product has identical terms; otherwise the result is `varies_by_product_needs_clarification`.
+- Also fixed:
+  - RxNorm names with disambiguation prefixes (`NDA021457 200 ACTUAT …`) now parse, so metered-dose inhalers match.
+  - "insulin glargine" no longer matches the biosimilar "insulin glargine-yfgn" unless it is written.
+  - "vitamin D3/D2" now maps to cholecalciferol/ergocalciferol.
+
+**Remote (ChatGPT) server**
+9. An email counts only when its verified claim is the JSON literal `true`, for both token claims and userinfo. The `MEDCARE_REQUIRE_EMAIL_VERIFIED` opt-out is removed.
+10. Userinfo, metadata and JWKS requests never follow redirects. They go only to plain-HTTPS URLs (no embedded credentials) on the issuer's host or an explicitly configured host. The bearer token cannot be forwarded elsewhere.
+11. A userinfo response must contain a string `sub` exactly equal to the token's `sub`.
+12. Logs record only allow-listed JSON-RPC method names; anything else is logged as `unknown`.
+
+**Docs**
+- The ZIP README says the remote server is not in the ZIP and links to the repository checkout. A test checks that every relative README link resolves inside the ZIP.
+
 ## 1.2.0 — whole medication lists, and a remote (ChatGPT) transport
 **Medication lists (Codex and ChatGPT)**
 - New tool `medication_list_check` (28 tools in total). It takes a pasted list (`text`) and/or a structured `medications` array, with optional `plan_ids` (default: the three MedCare 2027 plans) and `year`. It returns one result per entry, in input order, with the original text kept.

@@ -63,9 +63,47 @@ def _batch_ok(r):
     return True
 
 
+# Review of 1.2.0: adversarial strength/form/comma/brand cases against live RxNav + the CMS file (synthetic list)
+ADVERSARIAL_LIST = """hydrocortisone 1% cream
+insulin glargine 100 mg/mL vial
+insulin glargine 100 units/mL vial
+losartan/HCTZ 12.5/50 mg
+losartan/HCTZ 50/12.5 mg
+losartan/HCTZ 50-12.5
+albuterol 2.5 mg/3 mL nebulizer solution
+albuterol HFA 90 mcg/act inhaler
+cholecalciferol 1,000 units capsule
+levothyroxine 0,025 mg tablet
+lisinopril 10 mg tablet
+lisinopril (Zestril) 10 mg tablet
+"""
+
+
+def _adversarial_ok(r):
+    res = r["results"]
+    assert len(res) == 12, [x["original"] for x in res]
+    prods = lambda i: [m["product"] for m in res[i].get("matched_products", [])]  # noqa: E731
+    assert all("10 MG/" in p for p in prods(0)) and not any(" 1 MG/" in p for p in prods(0))
+    assert res[1]["status"] == "needs_clarification" and not prods(1)                 # mg/mL never = UNT/ML
+    assert prods(2) and all("UNT/ML Injectable Solution" in p and "yfgn" not in p for p in prods(2))
+    assert res[3]["status"] == "needs_clarification" and not prods(3)                 # reversed association
+    assert prods(4) == ["hydrochlorothiazide 12.5 MG / losartan potassium 50 MG Oral Tablet"]
+    assert res[5]["clarification"]["reason"] == "strength_unit_not_stated"
+    assert prods(6) and all("Inhalation Solution" in p for p in prods(6))
+    assert prods(7) and all("Metered Dose Inhaler" in p for p in prods(7))
+    assert [s["value"] for s in res[8]["parsed"]["strengths"]] == [1000.0]
+    assert prods(9) == ["levothyroxine sodium 0.025 MG Oral Tablet"]
+    assert "duplicate_of" not in res[11] and res[11]["match"]["brand_intent"] and "[Zestril]" in prods(11)[0]
+    return True
+
+
 CALLS = [
     ("medication_list_check", {"text": SYNTHETIC_LIST, "plan_ids": ["H5767-001", "H5767-002", "H5767-003", "H7993-030"],
                                "year": 2027}, _batch_ok),
+    ("medication_list_check", {"text": ADVERSARIAL_LIST, "plan_ids": ["H5767-001"], "year": 2027,
+                               "include_medcare_site": False}, _adversarial_ok),
+    ("medication_list_check", {"medications": [{"name": "Patient Synthetic Example"}], "plan_ids": ["H5767-001"]},
+     lambda r: r["results"][0]["status"] == "invalid_entry" and "redacted" in r["results"][0]["original"]),
     ("source_status", {"check_cms": True}, lambda r: r["cms_landscape_2027"]["data_last_updated"]),
     ("medcare_site_audit", {}, lambda r: r["summary"]["identity_mismatches"] >= 1),
     ("medcare_search_resources", {"query": "appointment of representative"}, lambda r: r["resources"]),
