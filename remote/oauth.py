@@ -194,16 +194,31 @@ class Verifier:
             raise AuthError(403, "access_denied", "this account is not on the MedCare Resources team allowlist")
         return {"sub": sub, "email": email, "scopes": sorted(scopes)}
 
+    @staticmethod
+    def _claim_verified(claims: dict, name: str, value: str) -> bool:
+        """Is THIS email value asserted verified? Verification is bound to the exact email it describes.
+
+        * standard 'email': only 'email_verified' is literal true.
+        * custom claim X: 'X_verified' is literal true. If 'X_verified' is present with any other value
+          (false, "true", 1, null ...) the email is unverified; nothing overrides an explicit assertion.
+          Only when 'X_verified' is absent may the standard 'email_verified' be used, and only if the
+          standard 'email' is present and is the same address as X.
+        """
+        if name == "email":
+            return claims.get("email_verified") is True
+        flag = name + "_verified"
+        if flag in claims:
+            return claims[flag] is True
+        std = claims.get("email")
+        return (isinstance(std, str) and std.strip().lower() == value.strip().lower()
+                and claims.get("email_verified") is True)
+
     def _email(self, claims: dict, token: str) -> str | None:
         """The caller's email, only if the IdP asserts it is verified with the literal JSON value true."""
         for name in self.cfg.email_claims:
             value = claims.get(name)
-            if isinstance(value, str) and "@" in value:
-                verified = claims.get(name + "_verified") if name != "email" else claims.get("email_verified")
-                if verified is not True and name != "email":
-                    verified = claims.get("email_verified")
-                if verified is True:
-                    return value.strip().lower()
+            if isinstance(value, str) and "@" in value and self._claim_verified(claims, name, value):
+                return value.strip().lower()
         if not (self.cfg.allowed_emails and self.cfg.userinfo_fallback):
             return None
         key = hashlib.sha256(token.encode()).hexdigest()

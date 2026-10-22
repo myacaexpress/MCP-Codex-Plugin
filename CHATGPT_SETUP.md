@@ -86,7 +86,8 @@ Setting names below come from Auth0's documentation. Confirm them in your dashbo
    - Or use Google Workspace or Microsoft login restricted to your domain.
    - Either way, the server's allowlist still applies.
 5. **Email claim.** Add a post-login Action so access tokens carry the verified email. (Without it, the server falls back to the IdP's `/userinfo`, which also works.)
-   - The server accepts an email only when its verified flag is the JSON value `true`. Strings such as `"true"`, `1` or a missing flag are refused.
+   - The server accepts an email only when **that address's own** verified flag is the JSON value `true`. Strings such as `"true"`, `1` or a missing flag are refused.
+   - A custom email claim needs its own `…_verified: true` (the Action above sets it). If that flag is missing, the standard `email_verified` counts only when the standard `email` is the same address. An explicit `false` is never overridden.
    - A `/userinfo` answer counts only if it names exactly the same `sub` as the token.
    - The token is sent to `/userinfo` only over HTTPS on the issuer's host (or a host you configure explicitly in `MEDCARE_OAUTH_USERINFO_URL`). Redirects are never followed.
    ```js

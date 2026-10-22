@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.2 — remote OAuth: email verification bound to the exact address (review of 1.2.1)
+- **P1 fix.** An email is now treated as verified only by the verification flag that belongs to that same address:
+  - A custom claim (for example `https://medcare-resources/email`) needs its own `…_verified: true`.
+  - An explicit custom flag with any other value (`false`, `"true"`, `1`, `null`) is final and is never overridden.
+  - Only when the custom flag is absent may the standard `email_verified: true` be used, and only if the standard `email` is the same address.
+  - Before this fix, a token carrying a verified `outside@elsewhere.example` and an explicitly unverified, allowlisted custom email was accepted.
+- New mixed-claim regressions: 20 claim combinations × both claim orders, the reviewer's reproduction, and a check that subject-matched userinfo stays the only fallback when no claim is verified.
+- No changes to the Codex plugin's behaviour (the version is bumped only).
+
 ## 1.2.1 — fixes for the independent review of 1.2.0 (commit 19843bf)
 **Medication list matching (`medication_list_check`)**
 1. **Units, denominators and association.** A strength now matches only when value, unit and denominator all agree:

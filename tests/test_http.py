@@ -412,3 +412,71 @@ def test_f12_logs_never_contain_caller_method_text(caplog):
     logs = "\n".join(r.getMessage() for r in caplog.records if r.name == "medcare.http")
     assert "FAKE" not in logs and "INJECTED" not in logs and "Synthetic" not in logs and "12345" not in logs
     assert "method=unknown status=200" in logs and "method=unknown,unknown" in logs and "method=ping" in logs
+
+
+# ---------------------------------------------------------------- review of 1.2.1: verification bound to the exact email
+NS = "https://medcare-resources/email"
+ALLOWED = "agent1@team.example.com"
+OUTSIDE = "outside@elsewhere.example"
+
+
+def _mixed(**claims):
+    base = {"email": None, "email_verified": None}
+    base.update(claims)
+    return token(**base)
+
+
+@pytest.mark.parametrize("order", [[NS, "email"], ["email", NS]])
+@pytest.mark.parametrize("claims,expected", [
+    # the reported bypass: allowlisted custom email explicitly unverified + DIFFERENT verified standard email
+    ({"email": OUTSIDE, "email_verified": True, NS: ALLOWED, NS + "_verified": False}, 403),
+    # custom flag missing: may not borrow verification from a different standard email
+    ({"email": OUTSIDE, "email_verified": True, NS: ALLOWED}, 403),
+    # custom flag present but not literal true never falls back
+    ({"email": ALLOWED, "email_verified": True, NS: ALLOWED, NS + "_verified": "true"}, None),
+    ({"email": OUTSIDE, "email_verified": True, NS: ALLOWED, NS + "_verified": None}, 403),
+    ({"email": OUTSIDE, "email_verified": True, NS: ALLOWED, NS + "_verified": 1}, 403),
+    # standard email is the allowlisted one but unverified; custom (different) verified
+    ({"email": ALLOWED, "email_verified": False, NS: OUTSIDE, NS + "_verified": True}, 403),
+    # both unverified
+    ({"email": ALLOWED, "email_verified": False, NS: ALLOWED, NS + "_verified": False}, 403),
+    # legitimate: custom verified with its own flag
+    ({"email": OUTSIDE, "email_verified": False, NS: ALLOWED, NS + "_verified": True}, 200),
+    # legitimate legacy: custom flag absent, standard email is the SAME address and verified
+    ({"email": "Agent1@Team.example.com", "email_verified": True, NS: ALLOWED}, 200),
+    # legitimate: only the standard email, verified
+    ({"email": ALLOWED, "email_verified": True}, 200),
+])
+def test_mixed_email_claims_bind_verification_to_the_same_address(order, claims, expected):
+    c = cfg(allowed_subjects=set(), email_claims=order)
+    app = client(config=c, userinfo=lambda u, t: {})          # no userinfo rescue
+    status = rpc(app, INIT, tok=_mixed(**claims)).status_code
+    if expected is None:
+        # explicit custom "true" (string) is unverified; access then depends only on the standard claim,
+        # which here is the same allowlisted address with its own literal true
+        expected = 200
+    assert status == expected, (order, claims, status)
+
+
+def test_reviewer_repro_unverified_custom_email_cannot_inherit_other_verification():
+    c = cfg(allowed_subjects=set(), email_claims=[NS, "email"])
+    v = Verifier(c, jwk_client=FakeJWKS(), userinfo_fetch=lambda *a: {})
+    t = token(email=OUTSIDE, email_verified=True, **{NS: ALLOWED, NS + "_verified": False})
+    with pytest.raises(AuthError) as err:
+        v.verify(t)
+    assert err.value.status == 403
+    assert Verifier._claim_verified({"email": OUTSIDE, "email_verified": True, NS: ALLOWED}, NS, ALLOWED) is False
+    assert Verifier._claim_verified({"email": ALLOWED, "email_verified": True, NS: ALLOWED, NS + "_verified": False},
+                                    NS, ALLOWED) is False
+
+
+def test_unverified_claim_still_allows_independent_userinfo_verification():
+    t = _mixed(email=OUTSIDE, email_verified=True, **{NS: ALLOWED, NS + "_verified": False})
+    c = cfg(allowed_subjects=set(), email_claims=[NS, "email"])
+    # the token's own verified email (OUTSIDE) is returned and is not allowlisted -> 403 even if userinfo says ALLOWED
+    ui = lambda u, tk: {"sub": "auth0|someone", "email": ALLOWED, "email_verified": True}  # noqa: E731
+    assert rpc(client(config=c, userinfo=ui), INIT, tok=t).status_code == 403
+    # with no verified email claim at all, subject-matched userinfo is the only path
+    t2 = _mixed(**{NS: ALLOWED, NS + "_verified": False})
+    assert rpc(client(config=c, userinfo=ui), INIT, tok=t2).status_code == 200
+    assert rpc(client(config=c, userinfo=lambda u, tk: {}), INIT, tok=t2).status_code == 403
