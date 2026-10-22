@@ -433,8 +433,8 @@ def _safe_meta(fn, year):
     files = sorted(_cms_dir().glob(pattern % year))
     if not files:
         return {"cached": False}
-    conn = sqlite3.connect(files[-1])
-    meta = dict(conn.execute("select key, value from meta").fetchall())
+    conn = cms._connect(files[-1])
+    meta = cms._meta(conn)
     conn.close()
     return {k: meta.get(k) for k in ("sha256", "file_date", "data_last_updated", "retrieved_at", "last_checked_at")}
 

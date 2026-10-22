@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
-from . import catalog, cms, net, sitecrawl
+from . import catalog, cms, fslock, net, sitecrawl
 from .textsearch import Index, matching_lines, rerank, snippet
 
 PLAN_COMPARE = "https://www.medicare.gov/plan-compare/"
@@ -310,7 +310,7 @@ def plan_document_retrieve(url: str, plan_id: str, year: int, document_type: str
     record["verified_plan_id"] = checks["verified_plan_id"]
     record["verified_year"] = checks["verified_year"]
     key = f"{cms.fmt_plan(*cms.parse_plan_id(plan_id))}_{year}_{document_type}_{resp.sha256[:12]}"
-    (_sb_dir() / f"{key}.json").write_text(json.dumps({**record, "pages": pages}))
+    fslock.atomic_write_text(_sb_dir() / f"{key}.json", json.dumps({**record, "pages": pages}))
     out = dict(record)
     out["first_page_preview"] = snippet(pages[0] if pages else "", "summary benefits", 600)
     out["next_step"] = ("Use plan_document_search(plan_id, year, query) to quote figures with page numbers."

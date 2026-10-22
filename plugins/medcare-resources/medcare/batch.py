@@ -19,6 +19,7 @@ Design rules (see README "Medication list check"):
 from __future__ import annotations
 
 import re
+import sqlite3
 from collections import OrderedDict
 import threading
 import time
@@ -888,7 +889,7 @@ def check_list(text: str = "", medications: list | None = None, plan_ids: list[s
     try:
         conn = cms.puf_db(year)
         cms_meta = cms.puf_source(year, conn)
-    except (net.FetchError, cms.CMSDataError, ValueError) as err:
+    except (net.FetchError, cms.CMSDataError, ValueError, sqlite3.Error, OSError) as err:
         conn = None
         for pid in plan_ids:
             plan_errors[pid] = f"CMS Part D file unavailable: {err}"
@@ -898,8 +899,8 @@ def check_list(text: str = "", medications: list | None = None, plan_ids: list[s
             try:
                 plan_ctx[pid] = _plan_context(conn, year, pid)
                 plan_ctx[pid]["cms_file"] = file_ref
-            except (ValueError, net.FetchError, cms.CMSDataError) as err:
-                plan_errors[pid] = str(err)
+            except (ValueError, net.FetchError, cms.CMSDataError, sqlite3.Error, OSError) as err:
+                plan_errors[pid] = f"{type(err).__name__}: {err}" if isinstance(err, (sqlite3.Error, OSError)) else str(err)
     nav_cache: dict = {}
 
     # 5. Lookups with bounded concurrency and an overall time budget.

@@ -2,7 +2,7 @@
 
 A standalone Codex plugin for teams who work with **MedCare Partners Health Plan of Texas** (https://mcpartnerstx.com, contract **H5767**) and who research Medicare plans. It bundles an MCP server with 28 tools and two skills. The same server can also be hosted for **ChatGPT** (see [ChatGPT](#chatgpt-remote-server) below).
 
-**Version 1.2.3** (1.2.0 plus fixes from its independent reviews) has `medication_list_check`, which checks a whole pasted medication list in one call, and a remote Streamable HTTP + OAuth transport for ChatGPT. See `CHANGELOG.md`.
+**Version 1.2.4** (1.2.0 plus fixes from its independent reviews) has `medication_list_check`, which checks a whole pasted medication list in one call, and a remote Streamable HTTP + OAuth transport for ChatGPT. See `CHANGELOG.md`.
 
 > Independent team tool. It is not affiliated with MedCare Partners, CMS or Medicare.gov. It uses **public information only**: no credentials, no member records, no enrollment or eligibility systems (no MARx), no Wayfinder dependency.
 
@@ -131,6 +131,7 @@ Re-running `python3 install.py --replace` is transactional. The new copy is chec
 - CMS caches are re-checked against CMS automatically when older than 7 days (set `MEDCARE_CMS_MAX_AGE_DAYS`) or on demand with `cms_refresh_data`. They are re-downloaded only when CMS publishes a new or revised file. If CMS can't be reached, the cached copy is used and `freshness.last_refresh_error` says so.
 - CMS data is downloaded on first use and cached in `~/.cache/medcare-resources` (Landscape about 13 MB, Part D members about 8 MB, Census about 7 MB). Set `MEDCARE_CACHE_DIR` to change the location.
 - The tools are read-only, apart from writing to that cache.
+- Several chats or processes can share the cache safely. Each dataset is built by one process at a time (a file lock) into its own temp file and published atomically; the others wait and reuse it. Published files are never modified in place.
 
 ## Privacy and safety
 - Tool inputs are plan IDs, county or ZIP, drug names and provider names. Never enter names, DOB, MBI, SSN, member IDs or clinical notes. The skills tell Codex the same.

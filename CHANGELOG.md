@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.2.4 — cross-process safe caches (review of 1.2.3)
+- **Problem fixed.** Separate MCP server processes sharing the per-user cache could corrupt each other's first build or refresh: several Codex chats, a test run, or the remote server's workers. Errors included `table formulary already exists`, `disk I/O error` and `attempt to write a readonly database`. The cause was a process-local lock, one shared `*.tmp` name per dataset, and in-place writes to published files.
+- **New `medcare/fslock.py`:**
+  - one builder per dataset across processes and threads (`fcntl.flock` on a per-dataset lock file);
+  - bounded wait (`MEDCARE_CACHE_LOCK_TIMEOUT`, default 900 s);
+  - a uniquely named temp file per build (pid + random), published with an atomic `os.replace`;
+  - a builder removes only its own temp; orphans of a dataset are removed only while holding that dataset's lock;
+  - atomic writes for small files.
+- **CMS Landscape, Part D file and Census ZIP→county caches:**
+  - double-checked locking: a process that waited reuses the file another process just published instead of rebuilding;
+  - published SQLite files are never written again and are opened read-only/immutable;
+  - freshness stamps (`last_checked_at`) move to an atomic sidecar (`<file>.checked.json`);
+  - old files are removed only after the new one is published.
+- **Other cache files:** the refreshed site catalog is written atomically under a lock, and readers accept it only as a matching catalog+documents pair. Verified carrier-document records are written atomically.
+- **Error handling stays explicit:**
+  - a cache lock timeout or SQLite/I/O error is reported as `CMSDataError`;
+  - in `medication_list_check` it becomes a per-plan `lookup_failed` with every entry still accounted for in order, never a crash or "not covered";
+  - if a previous cache exists, it is used and the timeout is disclosed in `freshness.last_refresh_error`.
+- **New deterministic multiprocess regressions** (`tests/test_cache_concurrency.py`, separate spawned processes, synthetic data):
+  - concurrent first build of each dataset: built once, every process succeeds, no temp files left;
+  - concurrent refresh to a new file while readers query;
+  - failed build: cleans its temp, releases the lock, reports the error;
+  - orphan cleanup scoped to the locked dataset;
+  - published files are read-only;
+  - cache errors keep every entry accounted.
+
+  These fail on 1.2.3 with the reported errors.
+
 ## 1.2.3 — explicit parenthetical brand is never lost (review of 1.2.1)
 - **Batch P1 fix.** Before 1.2.3, a parenthetical name such as `lisinopril (Zestril) 10 mg` was only queried when the first RxNorm response had no results. If that response did not include the brand, the generic was selected silently.
 - The parenthetical name is now captured before any lookup and **always queried**. The result depends on what RxNorm confirms:

@@ -8,7 +8,7 @@ import threading
 from functools import lru_cache
 from pathlib import Path
 
-from . import DATA, net, sitecrawl
+from . import DATA, fslock, net, sitecrawl
 from .textsearch import Index, matching_lines, rerank, snippet
 
 _LOCK = threading.RLock()
@@ -29,14 +29,20 @@ def _load():
         source = "bundled"
         cat_path, doc_path = p["bundled"]
         rc, rd = p["refreshed"]
+        catalog = docs = None
         if rc.exists() and rd.exists():
             try:
-                if json.loads(rc.read_text())["generated_at"] > json.loads(cat_path.read_text())["generated_at"]:
-                    cat_path, doc_path, source = rc, rd, "refreshed"
-            except (OSError, ValueError, KeyError):
+                rcat = json.loads(rc.read_text())
+                rdocs = json.loads(gzip.decompress(rd.read_bytes()))
+                if (rcat["generated_at"] > json.loads(cat_path.read_text())["generated_at"]
+                        and rdocs.get("generated_at") == rcat["generated_at"]):   # matching pair only
+                    catalog, docs, source = rcat, rdocs["documents"], "refreshed"
+                    cat_path, doc_path = rc, rd
+            except (OSError, ValueError, KeyError, EOFError):
                 pass
-        catalog = json.loads(cat_path.read_text())
-        docs = json.loads(gzip.decompress(doc_path.read_bytes()))["documents"]
+        if catalog is None:
+            catalog = json.loads(cat_path.read_text())
+            docs = json.loads(gzip.decompress(doc_path.read_bytes()))["documents"]
         by_id = {r["id"]: r for r in catalog["resources"]}
         pages = []
         for sha, d in docs.items():
@@ -330,8 +336,12 @@ def refresh_catalog() -> dict:
                                      "pages": texts[d["sha256"]]}
     cat_path, doc_path = _paths()["refreshed"]
     cat_path.parent.mkdir(parents=True, exist_ok=True)
-    doc_path.write_bytes(gzip.compress(json.dumps({"generated_at": new["generated_at"], "documents": docs}).encode()))
-    cat_path.write_text(json.dumps(new, ensure_ascii=False))
+    # Cross-process safe: one writer at a time, each file replaced atomically; readers accept the pair only
+    # when both carry the same generated_at (see _load), so a half-updated pair is never used.
+    with fslock.dataset_lock(cat_path.parent, "site_catalog"):
+        fslock.atomic_write_bytes(doc_path, gzip.compress(json.dumps({"generated_at": new["generated_at"],
+                                                                     "documents": docs}).encode()))
+        fslock.atomic_write_text(cat_path, json.dumps(new, ensure_ascii=False))
     old_urls = {r.get("url"): r for r in old["resources"] if r.get("url")}
     new_urls = {r.get("url"): r for r in new["resources"] if r.get("url")}
     changed = [u for u in new_urls if u in old_urls and (new_urls[u].get("document") or {}).get("sha256")

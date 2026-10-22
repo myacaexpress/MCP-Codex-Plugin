@@ -20,13 +20,12 @@ import os
 import json
 import re
 import sqlite3
-import threading
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-from . import net
+from . import fslock, net
 
 LANDSCAPE_PAGE = "https://www.cms.gov/medicare/coverage/prescription-drug-coverage"
 CMS_CATALOG = "https://data.cms.gov/data.json"
@@ -40,7 +39,6 @@ CMS_HOSTS = frozenset({"www.cms.gov", "cms.gov", "data.cms.gov"})
 CENSUS_HOSTS = frozenset({"www2.census.gov"})
 RXNAV_HOSTS = frozenset({"rxnav.nlm.nih.gov"})
 
-_LOCK = threading.RLock()
 PLAN_RE = re.compile(r"^\s*([HRSE]\d{4})[-_ ]?(\d{3})(?:[-_ ](\d{1,3}))?\s*$", re.I)
 
 DAYS = {"1": "30-day", "2": "90-day", "3": "other", "4": "60-day"}
@@ -83,10 +81,6 @@ def _cms_dir() -> Path:
     return d
 
 
-def _meta(conn) -> dict:
-    return dict(conn.execute("select key, value from meta").fetchall())
-
-
 # ---------------------------------------------------------------- Landscape
 def _discover_landscape(year: int) -> str:
     page = net.fetch(LANDSCAPE_PAGE, hosts=CMS_HOSTS, max_bytes=5_000_000).text()
@@ -109,8 +103,7 @@ def _build_landscape(year: int, url: str, target: Path) -> None:
         if readme_name:
             m = re.search(r"Data Last Updated:\s*([0-9/]+)", z.read(readme_name).decode("utf-8", "replace"))
             updated = m.group(1) if m else None
-        tmp = target.with_suffix(".tmp")
-        tmp.unlink(missing_ok=True)
+        tmp = fslock.temp_path(target)   # owned by this build; never shared with another builder
         conn = sqlite3.connect(tmp)
         conn.execute("create table meta(key text primary key, value text)")
         # Plan attributes are identical across counties within a plan/state (checked at build),
@@ -144,22 +137,52 @@ def _build_landscape(year: int, url: str, target: Path) -> None:
                 "retrieved_at": resp.fetched_at, "sha256": resp.sha256, "file": csv_name}
         meta["last_checked_at"] = meta["retrieved_at"]
         conn.executemany("insert into meta values (?,?)", list(meta.items()))
-        conn.commit()
-        conn.close()
-        tmp.replace(target)
+        _publish(conn, tmp, target)
+
+
+class _CacheConn(sqlite3.Connection):
+    cache_path: Path | None = None
 
 
 def _connect(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, check_same_thread=False)
+    """Open a PUBLISHED cache file read-only. Published files are immutable (replaced atomically, never
+    written in place), so readers take no locks and are unaffected by concurrent builders/refreshes."""
+    uri = Path(path).resolve().as_uri() + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False, factory=_CacheConn)
     conn.row_factory = sqlite3.Row
+    conn.cache_path = Path(path)
     return conn
 
 
+def _meta(conn) -> dict:
+    m = dict(conn.execute("select key, value from meta").fetchall())
+    path = getattr(conn, "cache_path", None)
+    if path is not None:
+        m.update(fslock.read_sidecar(path))  # freshness stamps live beside the immutable file
+    return m
+
+
 def _set_meta(path: Path, **values) -> None:
-    conn = sqlite3.connect(path)
-    conn.executemany("insert or replace into meta values (?,?)", [(k, str(v)) for k, v in values.items()])
+    fslock.write_sidecar(path, **values)
+
+
+def _new_db(target: Path) -> tuple[sqlite3.Connection, Path]:
+    tmp = fslock.temp_path(target)
+    return sqlite3.connect(tmp), tmp
+
+
+def _publish(conn: sqlite3.Connection, tmp: Path, target: Path) -> None:
     conn.commit()
     conn.close()
+    os.replace(tmp, target)
+
+
+def _discard(tmp: Path) -> None:
+    for p in (tmp, tmp.with_name(tmp.name + "-journal")):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _age_days(meta: dict, key: str = "last_checked_at") -> float | None:
@@ -181,6 +204,25 @@ def max_age_days() -> float:
 _REFRESH_ERRORS: dict = {}
 
 
+def _fresh(path: Path | None) -> bool:
+    if not path or not path.exists():
+        return False
+    try:
+        conn = _connect(path)
+        try:
+            age = _age_days(_meta(conn))
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return age is not None and age < max_age_days()
+
+
+def _latest(pattern: str) -> tuple[list[Path], Path | None]:
+    existing = sorted(_cms_dir().glob(pattern))
+    return existing, (existing[-1] if existing else None)
+
+
 def landscape_db(year: int, refresh: bool = False, force: bool = False) -> sqlite3.Connection:
     """Cached Landscape DB with a freshness policy.
 
@@ -188,14 +230,25 @@ def landscape_db(year: int, refresh: bool = False, force: bool = False) -> sqlit
     or when refresh=True. It is re-downloaded only if CMS published a new file or the file's
     Last-Modified changed (CMS revises the same file name, e.g. 10/18 star ratings), or force=True.
     If cms.gov is unreachable the existing cache is used and the failure is disclosed in the source.
+    Checks, builds and publication are serialised across processes (fslock); readers never wait.
     """
-    with _LOCK:
-        existing = sorted(_cms_dir().glob(f"landscape_v2_{year}_*.sqlite"))
-        current = existing[-1] if existing else None
-        if current and not refresh and not force:
-            age = _age_days(_meta(_connect(current)))
-            if age is not None and age < max_age_days():
-                return _connect(current)
+    pattern = f"landscape_v2_{year}_*.sqlite"
+    _, current = _latest(pattern)
+    if current and not refresh and not force and _fresh(current):
+        return _connect(current)
+    try:
+        lock = fslock.dataset_lock(_cms_dir(), f"landscape_{year}")
+        lock.__enter__()
+    except fslock.CacheLockTimeout as err:
+        if current:
+            _REFRESH_ERRORS[("landscape", year)] = f"{net.now_iso()}: {err}"
+            return _connect(current)
+        raise CMSDataError(str(err)) from None
+    try:
+        fslock.remove_orphan_temps(_cms_dir(), f"landscape_v2_{year}_")
+        existing, current = _latest(pattern)          # another process may have just published
+        if current and not refresh and not force and _fresh(current):
+            return _connect(current)
         try:
             url = _discover_landscape(year)
             stamp = re.search(r"-(\d{6})\.zip$", url).group(1)
@@ -213,12 +266,20 @@ def landscape_db(year: int, refresh: bool = False, force: bool = False) -> sqlit
                 _set_meta(current, last_checked_at=net.now_iso())
                 _REFRESH_ERRORS.pop(("landscape", year), None)
                 return _connect(current)
-        _build_landscape(year, url, target)
+        try:
+            _build_landscape(year, url, target)
+        except BaseException:
+            fslock.remove_orphan_temps(_cms_dir(), f"landscape_v2_{year}_")
+            raise
+        fslock.sidecar(target).unlink(missing_ok=True)   # fresh build: stamps come from the new file
         for old in existing:
             if old != target:
                 old.unlink(missing_ok=True)
+                fslock.sidecar(old).unlink(missing_ok=True)
         _REFRESH_ERRORS.pop(("landscape", year), None)
         return _connect(target)
+    finally:
+        lock.__exit__(None, None, None)
 
 
 def _freshness(meta: dict, dataset: str, year: int) -> dict:
@@ -350,30 +411,40 @@ def contract_plans(year: int, contract: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------- ZIP -> county
+def _build_zcta(path: Path) -> None:
+    resp = net.fetch(ZCTA_URL, hosts=CENSUS_HOSTS, max_bytes=30_000_000, timeout=120, accept="text/plain,*/*")
+    tmp = fslock.temp_path(path)
+    conn = sqlite3.connect(tmp)
+    conn.execute("create table z(zcta text, county_fips text, county text, land_part integer)")
+    conn.execute("create table meta(key text primary key, value text)")
+    reader = csv.DictReader(io.StringIO(resp.body.decode("utf-8-sig")), delimiter="|")
+    rows = [(r["GEOID_ZCTA5_20"], r["GEOID_COUNTY_20"], r["NAMELSAD_COUNTY_20"],
+             int(r["AREALAND_PART"] or 0)) for r in reader if r.get("GEOID_ZCTA5_20")]
+    conn.executemany("insert into z values (?,?,?,?)", rows)
+    conn.execute("create index ix on z(zcta)")
+    conn.executemany("insert into meta values (?,?)", [("source_url", ZCTA_URL),
+                     ("retrieved_at", resp.fetched_at), ("vintage", "2020 Census ZCTA-to-county relationship")])
+    _publish(conn, tmp, path)
+
+
 def zip_counties(zip_code: str) -> dict:
     if not re.fullmatch(r"\d{5}", str(zip_code or "")):
         raise ValueError("ZIP code must be exactly five digits.")
     path = _cms_dir() / "zcta_county_2020.sqlite"
-    with _LOCK:
-        if not path.exists():
-            resp = net.fetch(ZCTA_URL, hosts=CENSUS_HOSTS, max_bytes=30_000_000, timeout=120,
-                             accept="text/plain,*/*")
-            tmp = path.with_suffix(".tmp")
-            tmp.unlink(missing_ok=True)
-            conn = sqlite3.connect(tmp)
-            conn.execute("create table z(zcta text, county_fips text, county text, land_part integer)")
-            conn.execute("create table meta(key text primary key, value text)")
-            reader = csv.DictReader(io.StringIO(resp.body.decode("utf-8-sig")), delimiter="|")
-            rows = [(r["GEOID_ZCTA5_20"], r["GEOID_COUNTY_20"], r["NAMELSAD_COUNTY_20"],
-                     int(r["AREALAND_PART"] or 0)) for r in reader if r.get("GEOID_ZCTA5_20")]
-            conn.executemany("insert into z values (?,?,?,?)", rows)
-            conn.execute("create index ix on z(zcta)")
-            conn.executemany("insert into meta values (?,?)", [("source_url", ZCTA_URL),
-                             ("retrieved_at", resp.fetched_at), ("vintage", "2020 Census ZCTA-to-county relationship")])
-            conn.commit()
-            conn.close()
-            tmp.replace(path)
-    conn = sqlite3.connect(path)
+    if not path.exists():
+        try:
+            with fslock.dataset_lock(_cms_dir(), "zcta_county_2020"):
+                if not path.exists():                  # double-checked: another process may have built it
+                    fslock.remove_orphan_temps(_cms_dir(), "zcta_county_2020")
+                    try:
+                        _build_zcta(path)
+                    except BaseException:
+                        fslock.remove_orphan_temps(_cms_dir(), "zcta_county_2020")
+                        raise
+        except fslock.CacheLockTimeout as err:
+            raise CMSDataError(str(err)) from None
+    conn = _connect(path)
+
     rows = conn.execute("select county_fips, county, land_part from z where zcta=? order by land_part desc",
                         (zip_code,)).fetchall()
     meta = dict(conn.execute("select key, value from meta").fetchall())
@@ -471,14 +542,25 @@ _PUF_MEMBERS = {
 
 
 def puf_db(year: int, refresh: bool = False, force: bool = False) -> sqlite3.Connection:
-    """Cached Part D PUF with the same freshness policy as landscape_db (new monthly file -> rebuild)."""
-    with _LOCK:
-        existing = sorted(_cms_dir().glob(f"partd_puf_{year}_*.sqlite"))
-        current = existing[-1] if existing else None
-        if current and not refresh and not force:
-            age = _age_days(_meta(_connect(current)))
-            if age is not None and age < max_age_days():
-                return _connect(current)
+    """Cached Part D PUF with the same freshness policy as landscape_db (new monthly file -> rebuild).
+    Checks, builds and publication are serialised across processes (fslock); readers never wait."""
+    pattern = f"partd_puf_{year}_*.sqlite"
+    _, current = _latest(pattern)
+    if current and not refresh and not force and _fresh(current):
+        return _connect(current)
+    try:
+        lock = fslock.dataset_lock(_cms_dir(), f"partd_puf_{year}")
+        lock.__enter__()
+    except fslock.CacheLockTimeout as err:
+        if current:
+            _REFRESH_ERRORS[("part_d", year)] = f"{net.now_iso()}: {err}"
+            return _connect(current)
+        raise CMSDataError(str(err)) from None
+    try:
+        fslock.remove_orphan_temps(_cms_dir(), f"partd_puf_{year}_")
+        existing, current = _latest(pattern)          # another process may have just published
+        if current and not refresh and not force and _fresh(current):
+            return _connect(current)
         try:
             url, stamp = _discover_puf(year)
         except (net.FetchError, CMSDataError) as err:
@@ -490,24 +572,28 @@ def puf_db(year: int, refresh: bool = False, force: bool = False) -> sqlite3.Con
         if target.exists() and not force:
             _set_meta(target, last_checked_at=net.now_iso())
             _REFRESH_ERRORS.pop(("part_d", year), None)
-            for old in existing:
-                if old != target:
-                    old.unlink(missing_ok=True)
-            return _connect(target)
-        _build_puf(year, url, stamp, target)
+        else:
+            try:
+                _build_puf(year, url, stamp, target)
+            except BaseException:
+                fslock.remove_orphan_temps(_cms_dir(), f"partd_puf_{year}_")
+                raise
+            fslock.sidecar(target).unlink(missing_ok=True)
+            _REFRESH_ERRORS.pop(("part_d", year), None)
         for old in existing:
             if old != target:
                 old.unlink(missing_ok=True)
-        _REFRESH_ERRORS.pop(("part_d", year), None)
+                fslock.sidecar(old).unlink(missing_ok=True)
         return _connect(target)
+    finally:
+        lock.__exit__(None, None, None)
 
 
 def _build_puf(year: int, url: str, stamp: str, target: Path) -> None:
     if True:
         rz = _RemoteZip(url)
         outer = zipfile.ZipFile(rz)
-        tmp = target.with_suffix(".tmp")
-        tmp.unlink(missing_ok=True)
+        tmp = fslock.temp_path(target)   # owned by this build; never shared with another builder
         conn = sqlite3.connect(tmp)
         conn.execute("create table meta(key text primary key, value text)")
         loaded = []
@@ -549,9 +635,7 @@ def _build_puf(year: int, url: str, stamp: str, target: Path) -> None:
                 "record_layout": PUF_LAYOUT}
         meta["last_checked_at"] = meta["retrieved_at"]
         conn.executemany("insert into meta values (?,?)", list(meta.items()))
-        conn.commit()
-        conn.close()
-        tmp.replace(target)
+        _publish(conn, tmp, target)
 
 
 def puf_source(year: int, conn: sqlite3.Connection | None = None) -> dict:
